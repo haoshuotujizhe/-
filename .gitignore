@@ -2,3 +2,4 @@
 *.JPG
 *.csv
 *.pyc
+*:Zone.Identifier
