@@ -74,23 +74,35 @@ def get_dataloaders(train_dir,train_label_csv,val_dir, config): #此处参数传
     input_size = tuple(config["input_size"])
 
     train_tf = transforms.Compose([
-        transforms.Resize(input_size),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std)
-    ])              #对训练用的图片进行数据增强
-
+    transforms.RandomResizedCrop(input_size, scale=(0.8, 1.0)),  # 保留主体为主
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.2),  # 新增垂直翻转
+    transforms.RandomRotation(20),  # 新增旋转
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),  # 轻微颜色扰动
+    transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET),  # 自动增强策略
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std),
+    transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3))  # 不宜太强
+])
+    resize_side = int(max(input_size) * 1.15)
     val_tf = transforms.Compose([
-        transforms.Resize(input_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std)
-    ])              #对验证用的图片无增强
+    transforms.Resize(resize_side),   # 稍微放大一点
+    transforms.CenterCrop(input_size),           # 居中裁剪到模型输入尺寸
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std)
+])
+
 
     train_set = CSVBaseDataset(img_dir=train_dir,  total_csv=train_label_csv,transform=train_tf)
-    val_set = CSVBaseDataset(img_dir=val_dir,  total_csv=train_label_csv,transform=val_tf)
+    val_set = CSVBaseDataset(img_dir=val_dir,  total_csv=train_label_csv,transform=val_tf,label_mapping=train_set.label_mapping)
 
-    train_loader = DataLoader(train_set, batch_size=config["batch_size"], shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=config["batch_size"], shuffle=False)
+    num_workers = max(2, (os.cpu_count() or 4) // 2)
+    pin = torch.cuda.is_available()
+    train_loader = DataLoader(train_set, batch_size=config["batch_size"], shuffle=True,
+                              num_workers=num_workers, pin_memory=pin, persistent_workers=pin,drop_last=True)
+    val_loader = DataLoader(val_set, batch_size=config["batch_size"], shuffle=False,
+                            num_workers=num_workers, pin_memory=pin, persistent_workers=pin)
+    
     return train_loader, val_loader
 
 def set_seed(seed=42):
@@ -98,6 +110,10 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
+    # 建议：确保可复现或更快
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 def save_model(model, path):
     torch.save(model.state_dict(), path)

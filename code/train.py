@@ -6,6 +6,11 @@ import json
 import torch.optim as optim
 from tqdm import tqdm
 import sys
+# from torch.amp import autocast,GradScaler
+try:
+    from torch.amp import autocast, GradScaler
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler
 
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -13,43 +18,35 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from model import build_model
 from utils import get_dataloaders, save_model, set_seed
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device):
-    model.train()  # 切换模型到训练模式（启用 Dropout、BN 层训练模式）
-    total_loss, total_correct, total = 0, 0, 0  # 累计损失、正确数、总样本数
-    
-    # 遍历训练数据加载器，tqdm 显示进度条
+def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler=None, use_amp=False, max_grad_norm=1.0):
+    model.train()
+    total_loss, total_correct, total = 0, 0, 0
     for imgs, labels in tqdm(dataloader, desc="Training", leave=False):
-        # 将数据移到训练设备（GPU/CPU）
-        imgs, labels = imgs.to(device), labels.to(device)
-        
-        # 梯度清零（避免上一轮梯度累积）
-        optimizer.zero_grad()
-        
-        # 前向传播：模型输出预测结果
-        outputs = model(imgs)
-        
-        # 计算损失（预测结果与真实标签的差异）
-        loss = criterion(outputs, labels)
-        
-        # 反向传播：计算梯度
-        loss.backward()
-        
-        # 优化器更新模型参数
-        optimizer.step()
-        
-        # 累计损失（乘以批次大小，因为 loss 是批次平均损失）
+        imgs, labels = imgs.to(device,non_blocking=True), labels.to(device,non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device_type="cuda",dtype=amp_dtype,enabled=use_amp):
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            optimizer.step()
+
         total_loss += loss.item() * imgs.size(0)
-        
-        # 计算预测准确率：取输出中概率最大的类别作为预测结果
-        _, preds = torch.max(outputs, 1)  # preds 是预测的类别索引
-        total_correct += (preds == labels).sum().item()  # 统计正确预测的数量
-        total += labels.size(0)  # 累计总样本数
-    
-    # 返回当前 epoch 的平均损失和准确率
+        _, preds = torch.max(outputs, 1)
+        total_correct += (preds == labels).sum().item()
+        total += labels.size(0)
     return total_loss / total, total_correct / total
 
 
-def validate(model, dataloader, criterion, device):
+def validate(model, dataloader, criterion, device,use_amp=False):
     model.eval()  # 切换模型到评估模式（关闭 Dropout、固定 BN 层统计量）
     total_loss, total_correct, total = 0, 0, 0  # 累计损失、正确数、总样本数
     
@@ -58,9 +55,9 @@ def validate(model, dataloader, criterion, device):
         # 遍历验证数据加载器
         for imgs, labels in tqdm(dataloader, desc="Validating", leave=False):
             imgs, labels = imgs.to(device), labels.to(device)  # 数据移到设备
-            
-            outputs = model(imgs)  # 前向传播（仅计算预测结果，不跟踪梯度）
-            loss = criterion(outputs, labels)  # 计算验证损失
+            with autocast(device_type="cuda",enabled=use_amp):
+                outputs = model(imgs)
+                loss = criterion(outputs, labels)
             
             # 累计损失和正确数（逻辑同训练阶段）
             total_loss += loss.item() * imgs.size(0)
@@ -87,7 +84,16 @@ if __name__ == "__main__":
 
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda"
+    # 根据设备选择 dtype（Ampere起优先用 bf16）
+    if device.type == "cuda" and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+    else:
+        amp_dtype = torch.float16
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
 
+    scaler = GradScaler('cuda',enabled=use_amp)
+    
     # 数据加载
     train_loader, val_loader = get_dataloaders(
         train_dir=config["train_dir"],
@@ -96,23 +102,42 @@ if __name__ == "__main__":
         config=config
     )
 
-    # 模型
+    # 模型与优化
     model = build_model(config).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
-
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # 标签平滑
+    optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=3, verbose=True
+    )
+    
     # 训练循环
     best_acc = 0.0
+    patience_counter = 0
+    max_patience = 7
+    model_save_dir = os.path.join(parent_dir, "model")
+    os.makedirs(model_save_dir, exist_ok=True)
+    best_model_path = os.path.join(model_save_dir, "best_model.pth")
+
     for epoch in range(config["epochs"]):
-        print(f"\nEpoch [{epoch+1}/{config['epochs']}]")
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
-        print(f"Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"\nEpoch [{epoch+1}/{config['epochs']}] LR: {optimizer.param_groups[0]['lr']:.6f}")
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, use_amp)
+        val_loss, val_acc = validate(model, val_loader, criterion, device, use_amp)
+        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+        print(f"Val   Loss: {val_loss:.4f}, Val   Acc: {val_acc:.4f}")
+
+        scheduler.step(val_acc)
 
         if val_acc > best_acc:
             best_acc = val_acc
-            os.makedirs("model", exist_ok=True)
-            save_model(model, "/root/autodl-tmp/submission/model/best_model.pth")
+            patience_counter = 0
+            save_model(model, best_model_path)
             print("✅ Saved new best model!")
+        else:
+            patience_counter += 1
+            print(f"⚠️ No improvement for {patience_counter} epochs")
+
+        if patience_counter >= max_patience:
+            print("Early stopping triggered")
+            break
 
     print("Training complete! Best accuracy:", best_acc)
