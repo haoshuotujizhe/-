@@ -8,6 +8,9 @@ import os
 import random
 import numpy as np
 
+from torch.utils.data import WeightedRandomSampler
+from collections import Counter
+
 class CSVBaseDataset(Dataset):
     """
     通用CSV数据集（支持训练集和验证集）
@@ -68,21 +71,31 @@ class CSVBaseDataset(Dataset):
         
         return image, label
     
-    
+            
+def _build_weighted_sampler(integer_labels):
+    #根据类别频次构造 WeightedRandomSampler（长尾数据更友好）
+    counts = Counter(integer_labels)
+        # 类别权重 = 1 / 频次
+    class_weight = {c: 1.0 / cnt for c, cnt in counts.items()}
+    sample_weights = [class_weight[y] for y in integer_labels]
+    return WeightedRandomSampler(weights=torch.DoubleTensor(sample_weights),
+                                 num_samples=len(sample_weights),
+                                 replacement=True)
+        
 def get_dataloaders(train_dir,train_label_csv,val_dir, config): #此处参数传入的是，训练用的图片的地址，带标签的csv文件的地址，验证用的图片的地址，模型参数json文件的地址
     mean, std = config["mean"], config["std"]
     input_size = tuple(config["input_size"])
 
     train_tf = transforms.Compose([
-    transforms.RandomResizedCrop(input_size, scale=(0.8, 1.0)),  # 保留主体为主
+    transforms.RandomResizedCrop(input_size, scale=(0.85, 1.0)),  # 保留主体为主
     transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomVerticalFlip(p=0.2),  # 新增垂直翻转
-    transforms.RandomRotation(20),  # 新增旋转
-    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),  # 轻微颜色扰动
+    # transforms.RandomVerticalFlip(p=0.2),  # 新增垂直翻转
+    transforms.RandomRotation(10),  # 新增旋转
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.03),  # 轻微颜色扰动
     transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET),  # 自动增强策略
     transforms.ToTensor(),
     transforms.Normalize(mean, std),
-    transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3))  # 不宜太强
+    transforms.RandomErasing(p=0.15, scale=(0.02, 0.10), ratio=(0.3, 3.3))  # 不宜太强
 ])
     resize_side = int(max(input_size) * 1.15)
     val_tf = transforms.Compose([
@@ -98,10 +111,25 @@ def get_dataloaders(train_dir,train_label_csv,val_dir, config): #此处参数传
 
     num_workers = max(2, (os.cpu_count() or 4) // 2)
     pin = torch.cuda.is_available()
-    train_loader = DataLoader(train_set, batch_size=config["batch_size"], shuffle=True,
-                              num_workers=num_workers, pin_memory=pin, persistent_workers=pin,drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=config["batch_size"], shuffle=False,
-                            num_workers=num_workers, pin_memory=pin, persistent_workers=pin)
+    
+    sampler = None
+    if config.get("use_weighted_sampler", False):
+        sampler = _build_weighted_sampler(train_set.integer_labels)
+        
+    train_loader = DataLoader(train_set, 
+                              batch_size=config["batch_size"], 
+                              shuffle=(sampler is None),
+                              sampler=sampler,
+                              num_workers=num_workers, 
+                              pin_memory=pin, 
+                              persistent_workers=pin,
+                              drop_last=True)
+    val_loader = DataLoader(val_set, 
+                            batch_size=config["batch_size"],
+                            shuffle=False,
+                            num_workers=num_workers,
+                            pin_memory=pin,
+                            persistent_workers=pin)
     
     return train_loader, val_loader
 
