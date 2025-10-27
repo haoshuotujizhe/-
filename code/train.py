@@ -6,11 +6,13 @@ import json
 import torch.optim as optim
 from tqdm import tqdm
 import sys
-# from torch.amp import autocast,GradScaler
+# 兼容新旧 AMP API
 try:
     from torch.amp import autocast, GradScaler
+    AMP_HAS_DEVICE = True
 except ImportError:
     from torch.cuda.amp import autocast, GradScaler
+    AMP_HAS_DEVICE = False
 
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -92,7 +94,11 @@ if __name__ == "__main__":
         amp_dtype = torch.float16
     amp_device = "cuda" if device.type == "cuda" else "cpu"
 
-    scaler = GradScaler('cuda',enabled=use_amp)
+    #scaler = GradScaler('cuda',enabled=use_amp)
+    if AMP_HAS_DEVICE:
+        scaler = GradScaler(enabled=use_amp, device='cuda' if device.type == 'cuda' else 'cpu')
+    else:
+        scaler = GradScaler('cuda',enabled=use_amp)
     
     # 数据加载
     train_loader, val_loader = get_dataloaders(
@@ -107,7 +113,7 @@ if __name__ == "__main__":
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # 标签平滑
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=3, verbose=True
+        optimizer, mode='max', factor=0.5, patience=3
     )
     
     # 训练循环
