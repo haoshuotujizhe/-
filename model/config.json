@@ -9,10 +9,10 @@
   "mean": [0.485, 0.456, 0.406],
   "std": [0.229, 0.224, 0.225],
 
-  "train_dir": "../datasets/train",
-  "val_dir": "../datasets/val",
-  "test_dir":"../datasets/test",
-  "train_label_csv": "../datasets/train_labels.csv",
+  "train_dir": "../submission/datasets/train",
+  "val_dir": "../submission/datasets/val",
+  "test_dir":"../submission/datasets/test",
+  "train_label_csv": "../submission/datasets/train_labels.csv",
   "vt_weight_list":[0.15,0],
 
 
