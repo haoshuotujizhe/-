@@ -7,31 +7,34 @@ from torchvision.models import EfficientNet_B7_Weights
 # model=models.efficientnet_b7(pretrained=True)       #导入efficientnet_b7预训练模型
 
 class Mymodel(nn.Module):        
-    def __init__(self,num_classes=100,use_pretrained=True):
-        super(Mymodel,self).__init__()      #super超类；调用 nn.Module 的构造方法，初始化 nn.Module 中定义的核心属性
+    def __init__(self, num_classes=100, use_pretrained=True):
+        super(Mymodel, self).__init__()
+        
         if use_pretrained:
-            self.backbone=models.efficientnet_b7(weights=EfficientNet_B7_Weights.IMAGENET1K_V1)
+            weights = EfficientNet_B7_Weights.IMAGENET1K_V1
+            self.backbone = models.efficientnet_b7(weights=weights)
         else:
-            self.backbone=models.efficientnet_b7(weights=None)
+            self.backbone = models.efficientnet_b7(weights=None)
         
-        in_features=self.backbone.classifier[1].in_features        #获取最后一层全连接层（fc）的输入特征数
+        in_features = self.backbone.classifier[1].in_features
         
-        
-        #self.backbone.classifier[1]=nn.Linear(in_features,num_classes)     #输入维度，输出维度100种花朵
+        # ✅ 使用简单的分类头（不要过度复杂化）
         self.backbone.classifier = nn.Sequential(
-            nn.Dropout(p=0.3, inplace=True),
-            nn.Linear(in_features, num_classes))
-        
-    def forward(self,x):        #x是输入模型的张量（通常是图像数据，形状为[batch_size, channels, height, width]）
+            nn.Dropout(p=0.5, inplace=True),
+            nn.Linear(in_features, num_classes)
+        )
+    
+    def forward(self, x):
         return self.backbone(x)
+
 def build_model(config):
     num_classes = config.get("num_classes", 100)
     use_pretrained = config.get("use_pretrained", True)
     model = Mymodel(num_classes=num_classes, use_pretrained=use_pretrained)
     return model
-    
-    
-    
-        
+
+
+
+
 
 

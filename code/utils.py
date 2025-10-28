@@ -97,12 +97,12 @@ def _build_weighted_sampler(integer_labels):
                                  num_samples=len(sample_weights),
                                  replacement=True)
         
-def get_dataloaders(train_dir,train_label_csv,val_dir, config, use_strong_aug=False): #此处参数传入的是，训练用的图片的地址，带标签的csv文件的地址,验证用的图片的地址，模型参数json文件的地址
+def get_dataloaders(train_dir, train_label_csv, val_dir, config, use_strong_aug=False):
     mean, std = config["mean"], config["std"]
     input_size = tuple(config["input_size"])
 
     if use_strong_aug:
-        # Phase 2: 强增强（全量微调时使用）
+        # 强增强（Phase 2）
         train_tf = transforms.Compose([
             transforms.RandomResizedCrop(input_size, scale=(0.85, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
@@ -114,48 +114,58 @@ def get_dataloaders(train_dir,train_label_csv,val_dir, config, use_strong_aug=Fa
             transforms.RandomErasing(p=0.15, scale=(0.02, 0.10), ratio=(0.3, 3.3))
         ])
     else:
-        # Phase 1: 轻量增强（只训练分类头时使用）
+        # 轻量增强（Phase 1）
         train_tf = transforms.Compose([
-            transforms.Resize(int(max(input_size) * 1.1)),
+            transforms.Resize((int(input_size[0] * 1.1), int(input_size[1] * 1.1))),
             transforms.RandomCrop(input_size),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
             transforms.ToTensor(),
             transforms.Normalize(mean, std)
         ])
-    resize_side = int(max(input_size) * 1.15)
+
     val_tf = transforms.Compose([
-    transforms.Resize(resize_side),   # 稍微放大一点
-    transforms.CenterCrop(input_size),           # 居中裁剪到模型输入尺寸
-    transforms.ToTensor(),
-    transforms.Normalize(mean, std)
-])
+        transforms.Resize((int(input_size[0] * 1.05), int(input_size[1] * 1.05))),
+        transforms.CenterCrop(input_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
 
-
-    train_set = CSVBaseDataset(img_dir=train_dir,  total_csv=train_label_csv,transform=train_tf)
-    val_set = CSVBaseDataset(img_dir=val_dir,  total_csv=train_label_csv,transform=val_tf,label_mapping=train_set.label_mapping)
-
-    num_workers = max(2, (os.cpu_count() or 4) // 2)
-    pin = torch.cuda.is_available()
+    # ✅ 先加载训练集，建立标签映射
+    train_set = CSVBaseDataset(img_dir=train_dir, total_csv=train_label_csv, transform=train_tf)
     
-    sampler = None
+    print(f"✅ 训练集加载完成:")
+    print(f"   样本数: {len(train_set)}")
+    print(f"   类别数: {len(train_set.label_mapping)}")
+    print(f"   类别范围: {min(train_set.label_mapping.keys())} ~ {max(train_set.label_mapping.keys())}")
+    print(f"   映射后标签范围: {min(train_set.integer_labels)} ~ {max(train_set.integer_labels)}")
+    
+    # ✅ 验证集使用训练集的标签映射
+    val_set = CSVBaseDataset(img_dir=val_dir, total_csv=train_label_csv, transform=val_tf, 
+                             label_mapping=train_set.label_mapping)
+    
+    print(f"✅ 验证集加载完成:")
+    print(f"   样本数: {len(val_set)}")
+    print(f"   映射后标签范围: {min(val_set.integer_labels)} ~ {max(val_set.integer_labels)}")
+    
+    # ✅ 检查标签映射是否一致
+    if set(val_set.integer_labels) - set(train_set.integer_labels):
+        print(f"⚠️  警告：验证集有训练集没有的标签！")
+    else:
+        print(f"✅ 验证集标签全部在训练集中")
+    print()
+
+    # 加权采样
     if config.get("use_weighted_sampler", False):
         sampler = _build_weighted_sampler(train_set.integer_labels)
-        
-    train_loader = DataLoader(train_set, 
-                              batch_size=config["batch_size"], 
-                              shuffle=(sampler is None),
-                              sampler=sampler,
-                              num_workers=num_workers, 
-                              pin_memory=pin, 
-                              persistent_workers=pin,
-                              drop_last=True)
-    val_loader = DataLoader(val_set, 
-                            batch_size=config["batch_size"],
-                            shuffle=False,
-                            num_workers=num_workers,
-                            pin_memory=pin,
-                            persistent_workers=pin)
+        train_loader = DataLoader(train_set, batch_size=config["batch_size"], 
+                                 sampler=sampler, num_workers=4, pin_memory=True)
+    else:
+        train_loader = DataLoader(train_set, batch_size=config["batch_size"], 
+                                 shuffle=True, num_workers=4, pin_memory=True)
+
+    val_loader = DataLoader(val_set, batch_size=config["batch_size"], 
+                           shuffle=False, num_workers=4, pin_memory=True)
     
     return train_loader, val_loader
 

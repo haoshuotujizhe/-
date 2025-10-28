@@ -257,38 +257,39 @@ if __name__ == "__main__":
     
     # 模型
     model = build_model(config).to(device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     
-    # EMA
+    # ✅ Phase 1 不初始化 EMA
     ema = None
-    if config.get("use_ema", False):
-        ema = ModelEMA(model, decay=float(config.get("ema_decay", 0.9998)),device=device)
+    
+    # 定义增强配置
+    aug_cfg_phase1 = {
+        "use_mixup": False,
+        "mixup_alpha": 0.0,
+        "use_cutmix": False,
+        "cutmix_alpha": 0.0,
+    }
+    
+    aug_cfg_phase2 = {
+        "use_mixup": bool(config.get("use_mixup", False)),
+        "mixup_alpha": float(config.get("mixup_alpha", 0.0)),
+        "use_cutmix": bool(config.get("use_cutmix", False)),
+        "cutmix_alpha": float(config.get("cutmix_alpha", 0.0)),
+    }
+    
+    print(f"✅ 增强配置已设置:")
+    print(f"   Phase 1 - Mixup: {aug_cfg_phase1['use_mixup']}, CutMix: {aug_cfg_phase1['use_cutmix']}")
+    print(f"   Phase 2 - Mixup: {aug_cfg_phase2['use_mixup']}, CutMix: {aug_cfg_phase2['use_cutmix']}")
+    print(f"   Label Smoothing: 0.05")
 
-    # 阶段1：只训练分类头（使用轻量增强）
+    # 阶段1：只训练分类头
     if head_epochs > 0:
-        print(f"=== Phase 1: Train classifier only for {head_epochs} epochs ===")
-        print("Using LIGHT augmentation for Phase 1")
-        
-        # 重新加载数据（使用轻量增强）
-        train_loader_p1, val_loader = get_dataloaders(
-            train_dir=config["train_dir"],
-            train_label_csv=config["train_label_csv"],
-            val_dir=config["val_dir"],
-            config=config,
-            use_strong_aug=False  # ✅ Phase 1 使用轻量增强
-        )
+        print(f"\n=== Phase 1: Train classifier only for {head_epochs} epochs ===")
+        print("⚠️  Phase 1 不使用 EMA（分类头从零开始训练）")
         
         set_trainable(model.backbone.features, False)
         set_trainable(model.backbone.classifier, True)
         optimizer = build_optimizer(model, lr_backbone=0.0, lr_head=lr_head)
-        
-        # ✅ Phase 1 不使用 Mixup/CutMix
-        aug_cfg_p1 = {
-            "use_mixup": False,
-            "mixup_alpha": 0.0,
-            "use_cutmix": False,
-            "cutmix_alpha": 0.0,
-        }
         
         best_acc = 0.0
         model_save_dir = os.path.join(parent_dir, "model")
@@ -297,44 +298,38 @@ if __name__ == "__main__":
         
         for epoch in range(head_epochs):
             print(f"\n[Phase1] Epoch {epoch+1}/{head_epochs}")
-            train_loss, train_acc = train_one_epoch(model, train_loader_p1, criterion, optimizer, device, 
-                                                   scaler, use_amp, aug_cfg=aug_cfg_p1, ema=ema, amp_dtype=amp_dtype)
-            eval_model = ema.ema if ema is not None else model
-            val_loss, val_acc = validate(eval_model, val_loader, criterion, device, use_amp, 
-                                        use_tta=use_tta, amp_dtype=amp_dtype)
+            # ✅ Phase 1 不使用 EMA（传入 ema=None）
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, 
+                                                   scaler, use_amp, aug_cfg=aug_cfg_phase1, ema=None, amp_dtype=amp_dtype)
+            # ✅ Phase 1 直接验证主模型（不用 EMA）
+            val_loss, val_acc = validate(model, val_loader, criterion, device, use_amp, 
+                                        use_tta=False, amp_dtype=amp_dtype)
             print(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
             
             if val_acc > best_acc:
                 best_acc = val_acc
-                save_model(eval_model, phase1_model_path)
+                save_model(model, phase1_model_path)
                 print("✅ Saved new best model (Phase1)")
                 
         # Phase 2 从 Phase 1 最佳权重开始
-        print(f"Loading Phase1 best model (Val Acc: {best_acc:.4f})")
-        model.load_state_dict(torch.load(phase1_model_path))
-        if ema is not None:
-            ema.ema.load_state_dict(torch.load(phase1_model_path))
+        print(f"\nLoading Phase1 best model (Val Acc: {best_acc:.4f})")
+        model.load_state_dict(torch.load(phase1_model_path, weights_only=True))
 
-    # 阶段2：解冻全量微调（使用强增强）
-    print("=== Phase 2: Fine-tune full network ===")
-    print("Using STRONG augmentation for Phase 2")
+    # ✅ Phase 2 开始时才初始化 EMA
+    print("\n=== Phase 2: Fine-tune full network ===")
     
-    # 重新加载数据（使用强增强）
-    train_loader_p2, val_loader = get_dataloaders(
-        train_dir=config["train_dir"],
-        train_label_csv=config["train_label_csv"],
-        val_dir=config["val_dir"],
-        config=config,
-        use_strong_aug=True  # ✅ Phase 2 使用强增强
-    )
+    if config.get("use_ema", False):
+        print("✅ 初始化 EMA（Phase 2）")
+        ema = ModelEMA(model, decay=float(config.get("ema_decay", 0.9998)), device=device)
+    else:
+        ema = None
     
     set_trainable(model, True)
     
-    #余弦退火 + Warmup
+    # 余弦退火 + Warmup
     optimizer = build_optimizer(model, lr_backbone=lr_backbone, lr_head=lr_head)
     from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
     
-    # Warmup 3 个 epoch，然后余弦退火
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=3)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=config["epochs"]-3, eta_min=1e-7)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[3])
@@ -342,17 +337,16 @@ if __name__ == "__main__":
     best_acc = 0.0
     patience_counter = 0
     max_patience = 7
-    model_save_dir = os.path.join(parent_dir, "model")
-    os.makedirs(model_save_dir, exist_ok=True)
     best_model_path = os.path.join(model_save_dir, "best_model.pth")
 
     for epoch in range(config["epochs"]):
         print(f"\n[Phase2] Epoch {epoch+1}/{config['epochs']} LR: {optimizer.param_groups[0]['lr']:.6f}")
-        train_loss, train_acc = train_one_epoch(model, train_loader_p2, criterion, optimizer, device, 
-                                               scaler, use_amp, aug_cfg=aug_cfg, ema=ema, amp_dtype=amp_dtype)
+        # ✅ Phase 2 使用 EMA
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, 
+                                               scaler, use_amp, aug_cfg=aug_cfg_phase2, ema=ema, amp_dtype=amp_dtype)
         eval_model = ema.ema if ema is not None else model
         val_loss, val_acc = validate(eval_model, val_loader, criterion, device, use_amp, 
-                                    use_tta=use_tta, amp_dtype=amp_dtype)
+                                    use_tta=False, amp_dtype=amp_dtype)  # ✅ Phase 2 也先禁用 TTA
         print(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
 
         scheduler.step()
@@ -370,4 +364,4 @@ if __name__ == "__main__":
             print("Early stopping triggered")
             break
 
-    print("Training complete! Best accuracy:", best_acc)
+    print(f"\nTraining complete! Best Val Accuracy: {best_acc:.4f}")
