@@ -264,22 +264,41 @@ if __name__ == "__main__":
     if config.get("use_ema", False):
         ema = ModelEMA(model, decay=float(config.get("ema_decay", 0.9998)),device=device)
 
-    # 阶段1：只训练分类头
+    # 阶段1：只训练分类头（使用轻量增强）
     if head_epochs > 0:
         print(f"=== Phase 1: Train classifier only for {head_epochs} epochs ===")
+        print("Using LIGHT augmentation for Phase 1")
+        
+        # 重新加载数据（使用轻量增强）
+        train_loader_p1, val_loader = get_dataloaders(
+            train_dir=config["train_dir"],
+            train_label_csv=config["train_label_csv"],
+            val_dir=config["val_dir"],
+            config=config,
+            use_strong_aug=False  # ✅ Phase 1 使用轻量增强
+        )
+        
         set_trainable(model.backbone.features, False)
         set_trainable(model.backbone.classifier, True)
         optimizer = build_optimizer(model, lr_backbone=0.0, lr_head=lr_head)
         
+        # ✅ Phase 1 不使用 Mixup/CutMix
+        aug_cfg_p1 = {
+            "use_mixup": False,
+            "mixup_alpha": 0.0,
+            "use_cutmix": False,
+            "cutmix_alpha": 0.0,
+        }
+        
         best_acc = 0.0
         model_save_dir = os.path.join(parent_dir, "model")
         os.makedirs(model_save_dir, exist_ok=True)
-        phase1_model_path = os.path.join(model_save_dir, "phase1_beat.pth")
+        phase1_model_path = os.path.join(model_save_dir, "phase1_best.pth")
         
         for epoch in range(head_epochs):
             print(f"\n[Phase1] Epoch {epoch+1}/{head_epochs}")
-            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, 
-                                                   scaler, use_amp, aug_cfg=aug_cfg, ema=ema, amp_dtype=amp_dtype)
+            train_loss, train_acc = train_one_epoch(model, train_loader_p1, criterion, optimizer, device, 
+                                                   scaler, use_amp, aug_cfg=aug_cfg_p1, ema=ema, amp_dtype=amp_dtype)
             eval_model = ema.ema if ema is not None else model
             val_loss, val_acc = validate(eval_model, val_loader, criterion, device, use_amp, 
                                         use_tta=use_tta, amp_dtype=amp_dtype)
@@ -296,8 +315,19 @@ if __name__ == "__main__":
         if ema is not None:
             ema.ema.load_state_dict(torch.load(phase1_model_path))
 
-    # 阶段2：解冻全量微调
+    # 阶段2：解冻全量微调（使用强增强）
     print("=== Phase 2: Fine-tune full network ===")
+    print("Using STRONG augmentation for Phase 2")
+    
+    # 重新加载数据（使用强增强）
+    train_loader_p2, val_loader = get_dataloaders(
+        train_dir=config["train_dir"],
+        train_label_csv=config["train_label_csv"],
+        val_dir=config["val_dir"],
+        config=config,
+        use_strong_aug=True  # ✅ Phase 2 使用强增强
+    )
+    
     set_trainable(model, True)
     
     #余弦退火 + Warmup
@@ -318,7 +348,7 @@ if __name__ == "__main__":
 
     for epoch in range(config["epochs"]):
         print(f"\n[Phase2] Epoch {epoch+1}/{config['epochs']} LR: {optimizer.param_groups[0]['lr']:.6f}")
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, 
+        train_loss, train_acc = train_one_epoch(model, train_loader_p2, criterion, optimizer, device, 
                                                scaler, use_amp, aug_cfg=aug_cfg, ema=ema, amp_dtype=amp_dtype)
         eval_model = ema.ema if ema is not None else model
         val_loss, val_acc = validate(eval_model, val_loader, criterion, device, use_amp, 

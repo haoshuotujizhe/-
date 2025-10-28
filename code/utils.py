@@ -26,46 +26,61 @@ class CSVBaseDataset(Dataset):
         """
         self.img_dir = img_dir
         self.transform = transform
-        self.df = pd.read_csv(total_csv)  # 读取总CSV
         
-        # 筛选出当前图片目录下存在的图片（只保留这些条目标签）
-        self.df = self._filter_existing_images(self.df, img_dir)
+        # 读取CSV
+        self.df = pd.read_csv(total_csv)
         
-        # 提取category_id（转为整数）
-        self.category_ids = self.df["category_id"].astype(int).tolist()
+        # 获取当前目录的文件列表
+        files_in_dir = set(os.listdir(img_dir))
+        
+        # 只保留目录中实际存在的文件
+        self.df = self.df[self.df["filename"].isin(files_in_dir)].reset_index(drop=True)
+        
         self.filenames = self.df["filename"].tolist()
+        self.category_ids = self.df["category_id"].astype(int).tolist()
         
-        # 处理标签映射：训练集自己生成，验证集复用训练集的
+        # ✅ 修复：建立标签映射
         if label_mapping is None:
-            # 训练集：生成category_id → 整数的映射（0开始连续）
-            self.unique_category_ids = sorted(list(set(self.category_ids)))
-            self.label_mapping = {cat_id: idx for idx, cat_id in enumerate(self.unique_category_ids)}
+            # 训练集：建立新的标签映射
+            unique_categories = sorted(set(self.category_ids))
+            self.label_mapping = {cat_id: idx for idx, cat_id in enumerate(unique_categories)}
         else:
-            # 验证集：复用训练集的映射（确保标签一致）
+            # 验证集：使用训练集的标签映射
             self.label_mapping = label_mapping
         
-        # 转换为模型需要的整数标签
-        self.integer_labels = [self.label_mapping[cat_id] for cat_id in self.category_ids]
-
-    def _filter_existing_images(self, df, img_dir):
-        """筛选出在img_dir中实际存在的图片条目"""
-        existing_filenames = []
-        for idx, row in df.iterrows():
-            img_path = os.path.join(img_dir, row["filename"])
-            if os.path.exists(img_path):
-                existing_filenames.append(row["filename"])
-        # 只保留存在的图片
-        return df[df["filename"].isin(existing_filenames)].reset_index(drop=True)
+        # ✅ 过滤掉验证集中无法映射的类别
+        valid_indices = []
+        valid_filenames = []
+        valid_category_ids = []
+        valid_integer_labels = []
+        
+        skipped_count = 0
+        for i, cat_id in enumerate(self.category_ids):
+            if cat_id in self.label_mapping:
+                valid_indices.append(i)
+                valid_filenames.append(self.filenames[i])
+                valid_category_ids.append(cat_id)
+                valid_integer_labels.append(self.label_mapping[cat_id])
+            else:
+                skipped_count += 1
+        
+        if skipped_count > 0:
+            print(f"⚠️  跳过 {skipped_count} 个无法映射的样本（验证集包含训练集中不存在的类别）")
+        
+        self.filenames = valid_filenames
+        self.category_ids = valid_category_ids
+        self.integer_labels = valid_integer_labels
 
     def __len__(self):
-        return len(self.df)
-
+        return len(self.filenames)
+    
     def __getitem__(self, idx):
         img_name = self.filenames[idx]
         label = self.integer_labels[idx]
-        img_path = os.path.join(self.img_dir, img_name)
         
+        img_path = os.path.join(self.img_dir, img_name)
         image = Image.open(img_path).convert("RGB")
+        
         if self.transform:
             image = self.transform(image)
         
@@ -82,21 +97,32 @@ def _build_weighted_sampler(integer_labels):
                                  num_samples=len(sample_weights),
                                  replacement=True)
         
-def get_dataloaders(train_dir,train_label_csv,val_dir, config): #此处参数传入的是，训练用的图片的地址，带标签的csv文件的地址，验证用的图片的地址，模型参数json文件的地址
+def get_dataloaders(train_dir,train_label_csv,val_dir, config, use_strong_aug=False): #此处参数传入的是，训练用的图片的地址，带标签的csv文件的地址,验证用的图片的地址，模型参数json文件的地址
     mean, std = config["mean"], config["std"]
     input_size = tuple(config["input_size"])
 
-    train_tf = transforms.Compose([
-    transforms.RandomResizedCrop(input_size, scale=(0.85, 1.0)),  # 保留主体为主
-    transforms.RandomHorizontalFlip(p=0.5),
-    # transforms.RandomVerticalFlip(p=0.2),  # 新增垂直翻转
-    transforms.RandomRotation(10),  # 新增旋转
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.03),  # 轻微颜色扰动
-    transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET),  # 自动增强策略
-    transforms.ToTensor(),
-    transforms.Normalize(mean, std),
-    transforms.RandomErasing(p=0.15, scale=(0.02, 0.10), ratio=(0.3, 3.3))  # 不宜太强
-])
+    if use_strong_aug:
+        # Phase 2: 强增强（全量微调时使用）
+        train_tf = transforms.Compose([
+            transforms.RandomResizedCrop(input_size, scale=(0.85, 1.0)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.03),
+            transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+            transforms.RandomErasing(p=0.15, scale=(0.02, 0.10), ratio=(0.3, 3.3))
+        ])
+    else:
+        # Phase 1: 轻量增强（只训练分类头时使用）
+        train_tf = transforms.Compose([
+            transforms.Resize(int(max(input_size) * 1.1)),
+            transforms.RandomCrop(input_size),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std)
+        ])
     resize_side = int(max(input_size) * 1.15)
     val_tf = transforms.Compose([
     transforms.Resize(resize_side),   # 稍微放大一点
