@@ -102,24 +102,30 @@ def get_dataloaders(train_dir, train_label_csv, val_dir, config, use_strong_aug=
     input_size = tuple(config["input_size"])
 
     if use_strong_aug:
-        # 强增强（Phase 2）
+        # ✅ Phase 2 强增强（目标 99%）
         train_tf = transforms.Compose([
-            transforms.RandomResizedCrop(input_size, scale=(0.85, 1.0)),
+            # 更激进的裁剪（0.7-1.0，原来是 0.85-1.0）
+            transforms.RandomResizedCrop(input_size, scale=(0.7, 1.0), ratio=(0.75, 1.33)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(10),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.03),
+            transforms.RandomVerticalFlip(p=0.3),  # 新增垂直翻转
+            transforms.RandomRotation(15),  # 增加旋转角度（原来 10°）
+            # 更强的颜色抖动
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.08),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),  # 新增平移
             transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
-            transforms.RandomErasing(p=0.15, scale=(0.02, 0.10), ratio=(0.3, 3.3))
+            # 更强的 RandomErasing（原来 0.15 → 0.25）
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.15), ratio=(0.3, 3.3))
         ])
     else:
-        # 轻量增强（Phase 1）
+        # Phase 1 轻量增强
         train_tf = transforms.Compose([
             transforms.Resize((int(input_size[0] * 1.1), int(input_size[1] * 1.1))),
             transforms.RandomCrop(input_size),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
             transforms.ToTensor(),
             transforms.Normalize(mean, std)
         ])

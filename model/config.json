@@ -1,8 +1,8 @@
 {
   "model_name": "efficientnet_b7",      
   "num_classes": 100,
-  "input_size": [456,456],
-  "batch_size": 8,
+  "input_size": [512,512],
+  "batch_size": 6,
   "learning_rate": 0.0001,
   "epochs": 60,
   "use_pretrained": true,
@@ -16,14 +16,14 @@
   "vt_weight_list":[0.15,0],
 
 
-  "head_epochs": 5,                    
-  "lr_backbone": 0.0001,              
-  "lr_head": 0.0005,                   
+  "lr_head": 0.0002,           
+  "head_epochs": 8,                    
+  "lr_backbone": 0.00005,              
   "use_weighted_sampler": false,        
   "use_mixup": true,
-  "mixup_alpha": 0.15,
+  "mixup_alpha": 0.2,
   "use_cutmix": true,
-  "cutmix_alpha": 0.8,
+  "cutmix_alpha": 1.0,
   "use_ema": true,
   "ema_decay": 0.9998,
   "use_tta": true                     

@@ -62,11 +62,21 @@ class ModelEMA:
 
     @torch.no_grad()
     def update(self, model):
+        # ✅ 同步参数 + BN buffers（避免 EMA 验证时统计量过期）
         d = self.decay
-        for ema_p, p in zip(self.ema.parameters(), model.parameters()):
-            if self.device is not None and self.device != p.device:
-                p = p.to(self.device)
-            ema_p.data.mul_(d).add_(p.data, alpha=1.0 - d)
+        msd = model.state_dict()
+        esd = self.ema.state_dict()
+        for k in esd.keys():
+            if not torch.is_floating_point(esd[k]):
+                # int buffer（num_batches_tracked 等）直接覆盖
+                esd[k].copy_(msd[k])
+            else:
+                if ("running_mean" in k) or ("running_var" in k):
+                    # BN running stats 直接同步，不做滑动平均
+                    esd[k].copy_(msd[k])
+                else:
+                    # 其余可训练浮点参数做 EMA
+                    esd[k].mul_(d).add_(msd[k], alpha=1.0 - d)
 
 def copy_model(model):
     import copy
@@ -165,7 +175,7 @@ def set_trainable(module, flag: bool):
     for p in module.parameters():
         p.requires_grad_(flag)
 
-def build_optimizer(model, lr_backbone, lr_head, weight_decay=1e-4):
+def build_optimizer(model, lr_backbone, lr_head, weight_decay=5e-4):  # ✅ 从 1e-4 提升到 5e-4
     """判别式学习率 + 正确的权重衰减排除（bn/bias不衰减）"""
     decay, no_decay = [], []
     for name, p in model.named_parameters():
@@ -257,7 +267,7 @@ if __name__ == "__main__":
     
     # 模型
     model = build_model(config).to(device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.02)  # ✅ 从 0.05 降到 0.02
     
     # ✅ Phase 1 不初始化 EMA
     ema = None
@@ -280,7 +290,7 @@ if __name__ == "__main__":
     print(f"✅ 增强配置已设置:")
     print(f"   Phase 1 - Mixup: {aug_cfg_phase1['use_mixup']}, CutMix: {aug_cfg_phase1['use_cutmix']}")
     print(f"   Phase 2 - Mixup: {aug_cfg_phase2['use_mixup']}, CutMix: {aug_cfg_phase2['use_cutmix']}")
-    print(f"   Label Smoothing: 0.05")
+    print(f"   Label Smoothing: 0.02")  # ✅ 更新显示
 
     # 阶段1：只训练分类头
     if head_epochs > 0:
@@ -317,6 +327,16 @@ if __name__ == "__main__":
 
     # ✅ Phase 2 开始时才初始化 EMA
     print("\n=== Phase 2: Fine-tune full network ===")
+    print("🔄 重新加载训练数据（使用强增强）...")
+    
+    # ✅ 重新加载数据（使用强增强）
+    train_loader, _ = get_dataloaders(
+        train_dir=config["train_dir"],
+        train_label_csv=config["train_label_csv"],
+        val_dir=config["val_dir"],
+        config=config,
+        use_strong_aug=True  # ✅ Phase 2 使用强增强
+    )
     
     if config.get("use_ema", False):
         print("✅ 初始化 EMA（Phase 2）")
@@ -326,32 +346,66 @@ if __name__ == "__main__":
     
     set_trainable(model, True)
     
-    # 余弦退火 + Warmup
-    optimizer = build_optimizer(model, lr_backbone=lr_backbone, lr_head=lr_head)
-    from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
+    # ✅ 使用 Warmup + CosineAnnealingWarmRestarts（更稳定，周期性重启）
+    optimizer = build_optimizer(model, lr_backbone=lr_backbone, lr_head=lr_head, weight_decay=5e-4)  # ✅ 增加权重衰减
+    from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
     
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=3)
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=config["epochs"]-3, eta_min=1e-7)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[3])
+    # Warmup 3 个 epoch
+    def warmup_lambda(epoch):
+        return (epoch + 1) / 3 if epoch < 3 else 1.0
+
+    warmup_scheduler = LambdaLR(optimizer, lr_lambda=warmup_lambda)
+    # ✅ 不重启的余弦退火，整个 Phase2 平滑下降
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=int(config["epochs"]), eta_min=1e-6)
 
     best_acc = 0.0
     patience_counter = 0
-    max_patience = 7
+    max_patience = 10       # 放宽早停（因为周期性重启）
+    min_epochs = 25         # 最小训练轮数
+    min_delta = 1e-4
     best_model_path = os.path.join(model_save_dir, "best_model.pth")
 
     for epoch in range(config["epochs"]):
-        print(f"\n[Phase2] Epoch {epoch+1}/{config['epochs']} LR: {optimizer.param_groups[0]['lr']:.6f}")
-        # ✅ Phase 2 使用 EMA
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, 
-                                               scaler, use_amp, aug_cfg=aug_cfg_phase2, ema=ema, amp_dtype=amp_dtype)
+        # ✅ 前 3 个 epoch 使用 warmup，之后使用 cosine
+        if epoch < 3:
+            current_lr = optimizer.param_groups[0]['lr'] * warmup_lambda(epoch)
+        else:
+            current_lr = optimizer.param_groups[0]['lr']
+        
+        print(f"\n[Phase2] Epoch {epoch+1}/{config['epochs']} LR: {current_lr:.6f}")
+        
+        # ✅ 动态减弱增强（第 15 个 epoch 后）
+        cur_aug = dict(aug_cfg_phase2)
+        if epoch >= 12:
+            cur_aug.update({"use_cutmix": False, "mixup_alpha": 0.05})
+            if epoch == 12:
+                print("   📉 减弱增强：已关闭 CutMix，Mixup alpha=0.05")
+        if epoch >= 18:
+            cur_aug.update({"use_mixup": False, "mixup_alpha": 0.0, "use_cutmix": False})
+            if epoch == 18:
+                print("   📴 彻底关闭 Mixup/CutMix 以收敛")
+        
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device,
+            scaler, use_amp, aug_cfg=cur_aug, ema=ema, amp_dtype=amp_dtype
+        )
         eval_model = ema.ema if ema is not None else model
+        if ema is not None:
+            # ✅ 再次确保 BN buffers 与当前模型一致
+            for (n, b_ema) in eval_model.named_buffers():
+                b_model = dict(model.named_buffers())[n]
+                b_ema.copy_(b_model)
         val_loss, val_acc = validate(eval_model, val_loader, criterion, device, use_amp, 
-                                    use_tta=False, amp_dtype=amp_dtype)  # ✅ Phase 2 也先禁用 TTA
+                                    use_tta=False, amp_dtype=amp_dtype)
         print(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
 
-        scheduler.step()
+        # ✅ 学习率调度
+        if epoch < 3:
+            warmup_scheduler.step()
+        else:
+            cosine_scheduler.step()
 
-        if val_acc > best_acc:
+        if val_acc > best_acc + min_delta:
             best_acc = val_acc
             patience_counter = 0
             save_model(eval_model, best_model_path)
@@ -360,8 +414,48 @@ if __name__ == "__main__":
             patience_counter += 1
             print(f"⚠️ No improvement for {patience_counter} epochs")
 
-        if patience_counter >= max_patience:
+        # ✅ 至少训练 min_epochs 后才早停
+        if (epoch + 1) >= min_epochs and patience_counter >= max_patience:
             print("Early stopping triggered")
             break
 
     print(f"\nTraining complete! Best Val Accuracy: {best_acc:.4f}")
+
+    # ✅ Phase 3: 高分辨率微调（可显著抬最后 0.3~0.8%）
+    if bool(config.get("final_finetune", True)):
+        print("\n=== Phase 3: High-res fine-tune ===")
+        cfg_p3 = dict(config)
+        cfg_p3["input_size"] = list(config.get("final_input_size", [600, 600]))
+        # 关强增强，只保留轻增强或 CenterCrop（在 utils 里按 use_strong_aug=False）
+        train_loader_p3, _ = get_dataloaders(
+            train_dir=cfg_p3["train_dir"],
+            train_label_csv=cfg_p3["train_label_csv"],
+            val_dir=cfg_p3["val_dir"],
+            config=cfg_p3,
+            use_strong_aug=False
+        )
+
+        # 小学习率微调（全部参数）
+        lr_mult = float(config.get("final_lr_mult", 0.2))
+        for pg in optimizer.param_groups:
+            pg["lr"] = max(pg["lr"] * lr_mult, 1e-6)
+
+        # 关闭 Mixup/CutMix
+        aug_p3 = {"use_mixup": False, "mixup_alpha": 0.0, "use_cutmix": False, "cutmix_alpha": 0.0}
+
+        final_epochs = int(config.get("final_epochs", 3))
+        for e in range(final_epochs):
+            print(f"\n[Phase3] Epoch {e+1}/{final_epochs}")
+            trl, tra = train_one_epoch(model, train_loader_p3, criterion, optimizer, device,
+                                       scaler, use_amp, aug_cfg=aug_p3, ema=ema, amp_dtype=amp_dtype)
+            eval_model = ema.ema if ema is not None else model
+            if ema is not None:
+                for (n, b_ema) in eval_model.named_buffers():
+                    b_model = dict(model.named_buffers())[n]
+                    b_ema.copy_(b_model)
+            vll, vla = validate(eval_model, val_loader, criterion, device, use_amp, use_tta=True, amp_dtype=amp_dtype)
+            print(f"Train Loss: {trl:.4f}, Acc: {tra:.4f} | Val Loss: {vll:.4f}, Acc: {vla:.4f}")
+            if vla > best_acc:
+                best_acc = vla
+                save_model(eval_model, best_model_path)
+                print("✅ Saved new best model (Phase3)")
