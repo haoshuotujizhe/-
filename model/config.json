@@ -11,7 +11,7 @@
 
   "train_dir": "../submission/datasets/train",
   "val_dir": "../submission/datasets/val",
-  "test_dir":"../submission/datasets/test",
+  "test_dir":"../datasets/test",
   "train_label_csv": "../submission/datasets/train_labels.csv",
   "vt_weight_list":[0.15,0],
 
@@ -26,5 +26,5 @@
   "cutmix_alpha": 0.8,
   "use_ema": true,
   "ema_decay": 0.9998,
-  "use_tta": false                     
+  "use_tta": true                     
 }

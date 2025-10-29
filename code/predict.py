@@ -1,5 +1,3 @@
-
-
 import os
 import argparse
 import json
@@ -57,24 +55,65 @@ def load_model(model_path, num_classes, device):
 #     model.eval()
 #     return model
 
-def preprocess_image(image_path):
-    """对单张图片进行预处理"""
+def preprocess_image(image_path, input_size=(456, 456), mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+    """对单张图片进行预处理（与训练保持一致）"""
     transform = transforms.Compose([
-        transforms.Resize((600, 600)),
+        transforms.Resize((int(input_size[0] * 1.05), int(input_size[1] * 1.05))),  # ✅ 与验证集一致
+        transforms.CenterCrop(input_size),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406],
-                             [0.229, 0.224, 0.225])
+        transforms.Normalize(mean, std)
     ])
     image = Image.open(image_path).convert("RGB")
-    return transform(image).unsqueeze(0)  # 增加 batch 维度
+    return transform(image).unsqueeze(0)
 
-def predict(model, image_tensor, device):
-    """单张图片预测"""
+def predict(model, image_tensor, device, use_tta=True):
+    """单张图片预测（6 种 TTA 是最优配置）"""
     image_tensor = image_tensor.to(device)
+    
     with torch.no_grad():
-        outputs = model(image_tensor)
+        if use_tta:
+            # ✅ 最优 TTA：6 种变换（平衡效果和速度）
+            outputs_list = []
+            h, w = image_tensor.shape[2], image_tensor.shape[3]
+            
+            # 1. 原图
+            outputs_list.append(model(image_tensor))
+            
+            # 2. 水平翻转
+            image_h_flip = torch.flip(image_tensor, dims=[3])
+            outputs_list.append(model(image_h_flip))
+            
+            # 3. 垂直翻转
+            image_v_flip = torch.flip(image_tensor, dims=[2])
+            outputs_list.append(model(image_v_flip))
+            
+            # 4. 水平+垂直翻转
+            image_hv_flip = torch.flip(image_tensor, dims=[2, 3])
+            outputs_list.append(model(image_hv_flip))
+            
+            # 5. 缩小 0.9 倍（保留最有效的尺度变换）
+            image_scale_down = F.interpolate(image_tensor, size=(int(h*0.9), int(w*0.9)), 
+                                            mode='bilinear', align_corners=False)
+            image_scale_down = F.interpolate(image_scale_down, size=(h, w), 
+                                            mode='bilinear', align_corners=False)
+            outputs_list.append(model(image_scale_down))
+            
+            # 6. 放大 1.1 倍（保留最有效的尺度变换）
+            image_scale_up = F.interpolate(image_tensor, size=(int(h*1.1), int(w*1.1)), 
+                                          mode='bilinear', align_corners=False)
+            crop_h = (image_scale_up.shape[2] - h) // 2
+            crop_w = (image_scale_up.shape[3] - w) // 2
+            image_scale_up = image_scale_up[:, :, crop_h:crop_h+h, crop_w:crop_w+w]
+            outputs_list.append(model(image_scale_up))
+            
+            # ✅ 平均所有预测
+            outputs = torch.mean(torch.stack(outputs_list), dim=0)
+        else:
+            outputs = model(image_tensor)
+        
         probs = F.softmax(outputs, dim=1)
         conf, pred = torch.max(probs, 1)
+    
     return int(pred.item()), float(conf.item())
 
 def main():
@@ -85,16 +124,12 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    #config = load_config("model/config.json")
-    # 获取 predict.py 所在的目录（即 code 文件夹）
     script_dir = Path(__file__).resolve().parent
-    # code 的上一级就是项目根目录（model 和 code 的共同父目录）
     project_root = script_dir.parent
-    # 拼接出 config.json 的绝对路径
     config_path = project_root / "model" / "config.json"
     config = load_config(config_path)
 
-    model_path = project_root/"model"/"best_model.pth"
+    model_path = project_root / "model" / "best_model.pth"
     model = load_model(model_path, config["num_classes"], device)
 
     image_dir = Path(args.test_img_dir)
@@ -103,12 +138,18 @@ def main():
         if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]
     ])
 
+    # ✅ 从 config 读取预处理参数
+    input_size = tuple(config["input_size"])
+    mean = config["mean"]
+    std = config["std"]
+    use_tta = config.get("use_tta", True)  # 从配置读取是否启用 TTA
+
     results = []
     for img_path in image_paths:
-        img_tensor = preprocess_image(img_path)
-        pred_index, confidence = predict(model, img_tensor, device)
+        img_tensor = preprocess_image(img_path, input_size=input_size, mean=mean, std=std)
+        pred_index, confidence = predict(model, img_tensor, device, use_tta=use_tta)
         
-        category_id=CATEGORY_IDS[pred_index]        #用CATEGORY_IDS表映射回去，而非简单的加减
+        category_id = CATEGORY_IDS[pred_index]
         
         results.append({
             "filename": img_path.name,
@@ -116,13 +157,13 @@ def main():
             "confidence": confidence
         })
 
-    # 保存为 UTF-8 CSV
     output_dir = Path(args.output_path).parent
     output_dir.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(results)
     df.to_csv(args.output_path, index=False, encoding="utf-8")
 
     print(f"✅ 预测完成，共处理 {len(results)} 张图片。结果已保存至：{args.output_path}")
+    print(f"   TTA: {'启用' if use_tta else '禁用'}")
 
 if __name__ == "__main__":
     main()
