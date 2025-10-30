@@ -90,7 +90,7 @@ class CSVBaseDataset(Dataset):
 def _build_weighted_sampler(integer_labels):
     #根据类别频次构造 WeightedRandomSampler（长尾数据更友好）
     counts = Counter(integer_labels)
-        # 类别权重 = 1 / 频次
+    # 类别权重 = 1 / 频次
     class_weight = {c: 1.0 / cnt for c, cnt in counts.items()}
     sample_weights = [class_weight[y] for y in integer_labels]
     return WeightedRandomSampler(weights=torch.DoubleTensor(sample_weights),
@@ -104,7 +104,6 @@ def get_dataloaders(train_dir, train_label_csv, val_dir, config, use_strong_aug=
     if use_strong_aug:
         # ✅ Phase 2 强增强（目标 99%）
         train_tf = transforms.Compose([
-            # 更激进的裁剪（0.7-1.0，原来是 0.85-1.0）
             transforms.RandomResizedCrop(input_size, scale=(0.7, 1.0), ratio=(0.75, 1.33)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.3),  # 新增垂直翻转
@@ -119,7 +118,7 @@ def get_dataloaders(train_dir, train_label_csv, val_dir, config, use_strong_aug=
             transforms.RandomErasing(p=0.25, scale=(0.02, 0.15), ratio=(0.3, 3.3))
         ])
     else:
-        # Phase 1 轻量增强
+        # Phase 1/3 轻量增强
         train_tf = transforms.Compose([
             transforms.Resize((int(input_size[0] * 1.1), int(input_size[1] * 1.1))),
             transforms.RandomCrop(input_size),
@@ -161,17 +160,43 @@ def get_dataloaders(train_dir, train_label_csv, val_dir, config, use_strong_aug=
         print(f"✅ 验证集标签全部在训练集中")
     print()
 
+    # ✅ 读取并行配置
+    num_workers = int(config.get("num_workers", 8))
+    persistent_workers = bool(config.get("persistent_workers", True)) and (num_workers > 0)
+    prefetch_factor = int(config.get("prefetch_factor", 4))
+
     # 加权采样
     if config.get("use_weighted_sampler", False):
         sampler = _build_weighted_sampler(train_set.integer_labels)
-        train_loader = DataLoader(train_set, batch_size=config["batch_size"], 
-                                 sampler=sampler, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(
+            train_set, 
+            batch_size=config["batch_size"], 
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor
+        )
     else:
-        train_loader = DataLoader(train_set, batch_size=config["batch_size"], 
-                                 shuffle=True, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(
+            train_set, 
+            batch_size=config["batch_size"], 
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor
+        )
 
-    val_loader = DataLoader(val_set, batch_size=config["batch_size"], 
-                           shuffle=False, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(
+        val_set, 
+        batch_size=config["batch_size"], 
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor
+    )
     
     return train_loader, val_loader
 
@@ -180,7 +205,6 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    # 建议：确保可复现或更快
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 

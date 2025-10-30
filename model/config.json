@@ -1,30 +1,42 @@
 {
   "model_name": "efficientnet_b7",      
   "num_classes": 100,
-  "input_size": [512,512],
-  "batch_size": 6,
+  "input_size": [512, 512],
+  "batch_size": 10,
   "learning_rate": 0.0001,
-  "epochs": 60,
+  "epochs": 80,
   "use_pretrained": true,
   "mean": [0.485, 0.456, 0.406],
   "std": [0.229, 0.224, 0.225],
 
   "train_dir": "../submission/datasets/train",
   "val_dir": "../submission/datasets/val",
-  "test_dir":"../datasets/test",
+  "test_dir": "../datasets/test",
   "train_label_csv": "../submission/datasets/train_labels.csv",
-  "vt_weight_list":[0.15,0],
+  "vt_weight_list": [0.15, 0],
 
-
-  "lr_head": 0.0002,           
-  "head_epochs": 8,                    
-  "lr_backbone": 0.00005,              
-  "use_weighted_sampler": false,        
+  "head_epochs": 8,
+  "lr_backbone": 0.000015,
+  "lr_head": 0.00008,
+  
+  "use_weighted_sampler": false,
   "use_mixup": true,
-  "mixup_alpha": 0.2,
+  "mixup_alpha": 0.15,
   "use_cutmix": true,
-  "cutmix_alpha": 1.0,
+  "cutmix_alpha": 0.4,
+  
   "use_ema": true,
-  "ema_decay": 0.9998,
-  "use_tta": true                     
+  "ema_decay": 0.9999,
+  "use_tta": true,
+
+  "num_workers": 8,
+  "persistent_workers": true,
+  "prefetch_factor": 4,
+
+  "allow_tf32": true,
+  "channels_last": true,
+
+  "tta_val_every": 5,
+
+  "final_finetune": false
 }
