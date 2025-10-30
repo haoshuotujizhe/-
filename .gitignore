@@ -3,3 +3,4 @@
 *.csv
 *.pyc
 *:Zone.Identifier
+model/*.pth
