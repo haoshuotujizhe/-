@@ -145,18 +145,47 @@ def main():
     use_tta = config.get("use_tta", True)  # 从配置读取是否启用 TTA
 
     results = []
-    for img_path in image_paths:
-        img_tensor = preprocess_image(img_path, input_size=input_size, mean=mean, std=std)
-        pred_index, confidence = predict(model, img_tensor, device, use_tta=use_tta)
+    # for img_path in image_paths:
+    #     img_tensor = preprocess_image(img_path, input_size=input_size, mean=mean, std=std)
+    #     pred_index, confidence = predict(model, img_tensor, device, use_tta=use_tta)
         
-        category_id = CATEGORY_IDS[pred_index]
+    #     category_id = CATEGORY_IDS[pred_index]
         
-        results.append({
-            "filename": img_path.name,
-            "category_id": category_id,
-            "confidence": confidence
-        })
+    #     results.append({
+    #         "filename": img_path.name,
+    #         "category_id": category_id,
+    #         "confidence": confidence
+    #     })
 
+    # ... (前面的代码保持不变)
+    use_tta = config.get("use_tta", True)  # 从配置读取是否启用 TTA
+
+    results = []
+    print(f"开始预测，共发现 {len(image_paths)} 张图片...")
+
+    for img_path in image_paths:
+        try:
+            # --- 尝试处理图片 ---
+            img_tensor = preprocess_image(img_path, input_size=input_size, mean=mean, std=std)
+            pred_index, confidence = predict(model, img_tensor, device, use_tta=use_tta)
+            
+            category_id = CATEGORY_IDS[pred_index]
+            
+            results.append({
+                "filename": img_path.name,
+                "category_id": category_id,
+                "confidence": confidence
+            })
+            
+        except (OSError, Exception) as e:
+            # --- 捕获错误并跳过 ---
+            # 这里会捕获 "image file is truncated" 以及其他无法读取图片的错误
+            print(f"⚠️ 跳过损坏图片: {img_path.name} | 错误信息: {e}")
+            continue
+
+    output_dir = Path(args.output_path).parent
+    # ... (后面的代码保持不变)
+    
     output_dir = Path(args.output_path).parent
     output_dir.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(results)
