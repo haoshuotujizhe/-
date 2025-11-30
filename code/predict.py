@@ -5,194 +5,201 @@ import pandas as pd
 from pathlib import Path
 from PIL import Image
 import torch
-from torchvision import transforms, models
 import torch.nn.functional as F
-from pathlib import Path
+from torchvision import transforms
 
 
+# ✅ 硬编码 152 个类别
 CATEGORY_IDS = [
-    # 164-245 范围
-    164, 165, 166, 167, 169, 171, 172, 173, 174, 176, 177, 178, 179, 180,
-    183, 184, 185, 186, 188, 189, 190, 192, 193, 194, 195, 197, 198, 199,
+    164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180,
+    181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 192, 193, 194, 195, 196, 197, 198, 199,
     200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213,
-    214, 215, 216, 217, 218, 220, 221, 222, 223, 224, 225, 226, 227, 228,
+    214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228,
     229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242,
-    243, 244, 245,
-    # 1734-1833 范围
+    243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269,
+    271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285, 287, 288, 289, 290, 291,
     1734, 1743, 1747, 1749, 1750, 1751, 1759, 1765, 1770, 1772, 1774, 1776,
     1777, 1780, 1784, 1785, 1786, 1789, 1796, 1797, 1801, 1805, 1806, 1808,
     1818, 1827, 1833
 ]
 
-def load_config(config_path="config.json"):
-    """读取配置文件"""
-    with open(config_path, "r", encoding="utf-8") as f:
+
+def load_config(path):
+    with open(path, "r") as f:
         return json.load(f)
 
-# 预测代码（predict.py）中修改 load_model 函数：
+
 def load_model(model_path, num_classes, device):
-    """加载训练好的模型(使用与训练时一致的Mymodel结构)"""
-    # 从 model 模块导入 build_model（与训练时一致的模型构建函数）
     from model import build_model
-    # 构建与训练时相同的模型结构（Mymodel类）
-    model = build_model({"num_classes": num_classes, "use_pretrained": False})  # 不加载预训练权重，避免冲突
-    # 加载保存的参数
-    state_dict = torch.load(model_path, map_location=device, weights_only=True)  # 加上weights_only=True更安全
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
+    model = build_model({"num_classes": num_classes, "use_pretrained": False})
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.to(device).eval()
     return model
 
-# def load_model(model_path, num_classes, device):
-#     """加载训练好的模型"""
-#     model = models.efficientnet_b7(weights=None)
-#     in_features = model.classifier[1].in_features
-#     model.classifier[1] = torch.nn.Linear(in_features, num_classes)
 
-#     state_dict = torch.load(model_path, map_location=device)
-#     model.load_state_dict(state_dict)
-#     model.to(device)
-#     model.eval()
-#     return model
-
-def preprocess_image(image_path, input_size=(456, 456), mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
-    """对单张图片进行预处理（与训练保持一致）"""
-    transform = transforms.Compose([
-        transforms.Resize((int(input_size[0] * 1.05), int(input_size[1] * 1.05))),  # ✅ 与验证集一致
-        transforms.CenterCrop(input_size),
+def preprocess_batch(image_paths, size, mean, std):
+    """批量预处理图片 - 优化版本"""
+    tf = transforms.Compose([
+        transforms.Resize((int(size[0]*1.05), int(size[1]*1.05))),
+        transforms.CenterCrop(size),
         transforms.ToTensor(),
         transforms.Normalize(mean, std)
     ])
-    image = Image.open(image_path).convert("RGB")
-    return transform(image).unsqueeze(0)
-
-def predict(model, image_tensor, device, use_tta=True):
-    """单张图片预测（6 种 TTA 是最优配置）"""
-    image_tensor = image_tensor.to(device)
     
+    images = []
+    valid_paths = []  # 记录成功处理的路径
+    
+    for path in image_paths:
+        try:
+            img = Image.open(path).convert("RGB")
+            images.append(tf(img))
+            valid_paths.append(path)
+        except Exception as e:
+            print(f"跳过损坏图片 {path.name}: {e}")
+            continue
+    
+    if images:  # 确保列表不为空
+        return torch.stack(images), valid_paths
+    else:
+        return torch.empty(0), []  # 返回空张量
+
+def predict_batch(model, imgs_batch, device, use_tta=True):
+    """批量预测（替代原predict函数）"""
+    imgs_batch = imgs_batch.to(device)
+    batch_size = imgs_batch.shape[0]
     with torch.no_grad():
         if use_tta:
-            # ✅ 最优 TTA：6 种变换（平衡效果和速度）
-            outputs_list = []
-            h, w = image_tensor.shape[2], image_tensor.shape[3]
-            
-            # 1. 原图
-            outputs_list.append(model(image_tensor))
-            
-            # 2. 水平翻转
-            image_h_flip = torch.flip(image_tensor, dims=[3])
-            outputs_list.append(model(image_h_flip))
-            
-            # 3. 垂直翻转
-            image_v_flip = torch.flip(image_tensor, dims=[2])
-            outputs_list.append(model(image_v_flip))
-            
-            # 4. 水平+垂直翻转
-            image_hv_flip = torch.flip(image_tensor, dims=[2, 3])
-            outputs_list.append(model(image_hv_flip))
-            
-            # 5. 缩小 0.9 倍（保留最有效的尺度变换）
-            image_scale_down = F.interpolate(image_tensor, size=(int(h*0.9), int(w*0.9)), 
-                                            mode='bilinear', align_corners=False)
-            image_scale_down = F.interpolate(image_scale_down, size=(h, w), 
-                                            mode='bilinear', align_corners=False)
-            outputs_list.append(model(image_scale_down))
-            
-            # 6. 放大 1.1 倍（保留最有效的尺度变换）
-            image_scale_up = F.interpolate(image_tensor, size=(int(h*1.1), int(w*1.1)), 
-                                          mode='bilinear', align_corners=False)
-            crop_h = (image_scale_up.shape[2] - h) // 2
-            crop_w = (image_scale_up.shape[3] - w) // 2
-            image_scale_up = image_scale_up[:, :, crop_h:crop_h+h, crop_w:crop_w+w]
-            outputs_list.append(model(image_scale_up))
-            
-            # ✅ 平均所有预测
-            outputs = torch.mean(torch.stack(outputs_list), dim=0)
+            h, w = imgs_batch.shape[2:]
+            outs = [model(imgs_batch)]
+            # 批量翻转（保持batch维度不变）
+            outs.append(model(torch.flip(imgs_batch, [3])))
+            outs.append(model(torch.flip(imgs_batch, [2])))
+            outs.append(model(torch.flip(imgs_batch, [2, 3])))
+            # 批量缩放
+            s = F.interpolate(imgs_batch, size=(int(h*0.9), int(w*0.9)), mode='bilinear', align_corners=False)
+            s = F.interpolate(s, size=(h, w), mode='bilinear', align_corners=False)
+            outs.append(model(s))
+            # 对batch中每个样本取平均（dim=0是TTA轮次维度）
+            out = torch.mean(torch.stack(outs), dim=0)
         else:
-            outputs = model(image_tensor)
+            out = model(imgs_batch)
         
-        probs = F.softmax(outputs, dim=1)
-        conf, pred = torch.max(probs, 1)
-    
-    return int(pred.item()), float(conf.item())
+        probs = F.softmax(out, dim=1)
+        confs, preds = probs.max(1)  # preds: [batch_size], confs: [batch_size]
+    return preds.cpu().numpy(), confs.cpu().numpy()
+def preprocess(path, size, mean, std):
+    tf = transforms.Compose([
+        transforms.Resize((int(size[0]*1.05), int(size[1]*1.05))),
+        transforms.CenterCrop(size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+    return tf(Image.open(path).convert("RGB")).unsqueeze(0)
+
+def predict(model, img, device, use_tta=True):
+    img = img.to(device)
+    with torch.no_grad():
+        if use_tta:
+            h, w = img.shape[2:]
+            outs = [model(img)]
+            outs.append(model(torch.flip(img, [3])))
+            outs.append(model(torch.flip(img, [2])))
+            outs.append(model(torch.flip(img, [2, 3])))
+            # 缩放
+            s = F.interpolate(img, size=(int(h*0.9), int(w*0.9)), mode='bilinear', align_corners=False)
+            s = F.interpolate(s, size=(h, w), mode='bilinear', align_corners=False)
+            outs.append(model(s))
+            out = torch.mean(torch.stack(outs), dim=0)
+        else:
+            out = model(img)
+        
+        probs = F.softmax(out, dim=1)
+        conf, pred = probs.max(1)
+    return pred.item(), conf.item()
 
 def main():
-    parser = argparse.ArgumentParser(description="花卉分类模型预测")
-    parser.add_argument("test_img_dir", type=str, help="测试图片目录")
-    parser.add_argument("output_path", type=str, help="预测结果 CSV 文件路径")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("test_img_dir", type=str)
+    parser.add_argument("output_path", type=str)
+    parser.add_argument("--batch_size", type=int, default=32, help="批量大小（根据GPU显存调整）")  # 新增批量参数
     args = parser.parse_args()
-
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent
-    config_path = project_root / "model" / "config.json"
-    config = load_config(config_path)
-
-    model_path = project_root / "model" / "best_model.pth"
-    model = load_model(model_path, config["num_classes"], device)
-
-    image_dir = Path(args.test_img_dir)
-    image_paths = sorted([
-        p for p in image_dir.iterdir()
-        if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]
-    ])
-
-    # ✅ 从 config 读取预处理参数
-    input_size = tuple(config["input_size"])
-    mean = config["mean"]
-    std = config["std"]
-    use_tta = config.get("use_tta", True)  # 从配置读取是否启用 TTA
-
-    results = []
-    # for img_path in image_paths:
-    #     img_tensor = preprocess_image(img_path, input_size=input_size, mean=mean, std=std)
-    #     pred_index, confidence = predict(model, img_tensor, device, use_tta=use_tta)
-        
-    #     category_id = CATEGORY_IDS[pred_index]
-        
-    #     results.append({
-    #         "filename": img_path.name,
-    #         "category_id": category_id,
-    #         "confidence": confidence
-    #     })
-
-    # ... (前面的代码保持不变)
-    use_tta = config.get("use_tta", True)  # 从配置读取是否启用 TTA
-
-    results = []
-    print(f"开始预测，共发现 {len(image_paths)} 张图片...")
-
-    for img_path in image_paths:
-        try:
-            # --- 尝试处理图片 ---
-            img_tensor = preprocess_image(img_path, input_size=input_size, mean=mean, std=std)
-            pred_index, confidence = predict(model, img_tensor, device, use_tta=use_tta)
-            
-            category_id = CATEGORY_IDS[pred_index]
-            
-            results.append({
-                "filename": img_path.name,
-                "category_id": category_id,
-                "confidence": confidence
-            })
-            
-        except (OSError, Exception) as e:
-            # --- 捕获错误并跳过 ---
-            # 这里会捕获 "image file is truncated" 以及其他无法读取图片的错误
-            print(f"⚠️ 跳过损坏图片: {img_path.name} | 错误信息: {e}")
-            continue
-
-    output_dir = Path(args.output_path).parent
-    # ... (后面的代码保持不变)
+    # 【新增】半精度推理（GPU专属优化，速度提升2~3倍，精度损失极小）
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
     
-    output_dir = Path(args.output_path).parent
-    output_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(results)
-    df.to_csv(args.output_path, index=False, encoding="utf-8")
-
-    print(f"✅ 预测完成，共处理 {len(results)} 张图片。结果已保存至：{args.output_path}")
-    print(f"   TTA: {'启用' if use_tta else '禁用'}")
-
-if __name__ == "__main__":
-    main()
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "model" / "config.json")
+    
+    # 一致性检查
+    if config["num_classes"] != len(CATEGORY_IDS):
+        raise ValueError(f"num_classes mismatch: {config['num_classes']} vs {len(CATEGORY_IDS)}")
+    
+    model = load_model(root / "model" / "best_model.pth", config["num_classes"], device)
+    model = model.to(dtype=dtype)  # 模型转半精度
+    
+    img_dir = Path(args.test_img_dir)
+    imgs = sorted([p for p in img_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
+    
+    size = tuple(config["input_size"])
+    mean, std = config["mean"], config["std"]
+    use_tta = config.get("use_tta", False)  # 默认关闭TTA，如需启用再改回True
+    batch_size = args.batch_size
+    
+    results = []
+    processed_count = 0
+    
+    print(f"开始处理 {len(imgs)} 张图片，批量大小: {batch_size}")
+    
+    for i in range(0, len(imgs), batch_size):
+        batch_paths = imgs[i:i+batch_size]
+        
+        # 【修改】获取预处理结果和有效路径
+        t_batch, valid_paths = preprocess_batch(batch_paths, size, mean, std)
+        
+        # 如果没有成功预处理的图片，跳过
+        if len(t_batch) == 0:
+            continue
+            
+        # 【修改】只在CUDA时转半精度
+        if device.type == "cuda":
+            t_batch = t_batch.half()
+        else:
+            t_batch = t_batch.float()
+            
+        try:
+            preds, confs = predict_batch(model, t_batch, device, use_tta)
+            
+            for path, pred_idx, conf in zip(valid_paths, preds, confs):
+                results.append({
+                    "filename": path.name,
+                    "category_id": CATEGORY_IDS[pred_idx],
+                    "confidence": round(float(conf), 6)  # 确保转为Python float
+                })
+                
+            processed_count += len(valid_paths)
+            print(f"进度: {processed_count}/{len(imgs)} ({(processed_count/len(imgs)*100):.1f}%)")
+            
+        except Exception as e:
+            print(f"批量推理出错: {e}")
+            # 【新增】单个图片回退处理
+            for path in valid_paths:
+                try:
+                    # 使用原始的单张图片处理逻辑
+                    # from your_original_predict import preprocess, predict  # 需要导入原函数
+                    img_tensor = preprocess(path, size, mean, std)
+                    if device.type == "cuda":
+                        img_tensor = img_tensor.half()
+                    idx, conf = predict(model, img_tensor, device, use_tta=False)  # 回退时禁用TTA
+                    results.append({
+                        "filename": path.name,
+                        "category_id": CATEGORY_IDS[idx],
+                        "confidence": round(conf, 6)
+                    })
+                except Exception as e2:
+                    print(f"回退处理失败 {path.name}: {e2}")
+                    continue
+    
+    Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(results).to_csv(args.output_path, index=False)

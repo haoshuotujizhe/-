@@ -1,40 +1,74 @@
-import torch        #采用pytorch训练
-import torch.nn as nn       #导入pytorchnn，用于快速构建神经网络
-from torchvision import models      #导入pytorch官方给的模型库
+import torch
+import torch.nn as nn
+from torchvision import models
+from torchvision.models import (
+    EfficientNet_B6_Weights,
+    EfficientNet_B7_Weights,
+    ConvNeXt_Base_Weights
+)
 
-from torchvision.models import EfficientNet_B7_Weights
 
-# model=models.efficientnet_b7(pretrained=True)       #导入efficientnet_b7预训练模型
-
-class Mymodel(nn.Module):        
-    def __init__(self, num_classes=100, use_pretrained=True):
+class Mymodel(nn.Module):
+    def __init__(self, num_classes=152, use_pretrained=True, model_name="convnext_base", stochastic_depth=0.0):
         super(Mymodel, self).__init__()
+        self.model_name = model_name
         
-        if use_pretrained:
-            weights = EfficientNet_B7_Weights.IMAGENET1K_V1
-            self.backbone = models.efficientnet_b7(weights=weights)
+        if model_name == "efficientnet_b6":
+            if use_pretrained:
+                self.backbone = models.efficientnet_b6(weights=EfficientNet_B6_Weights.IMAGENET1K_V1)
+            else:
+                self.backbone = models.efficientnet_b6(weights=None)
+            
+            in_features = self.backbone.classifier[1].in_features
+            self.backbone.classifier = nn.Sequential(
+                nn.Dropout(p=0.45, inplace=True),
+                nn.Linear(in_features, num_classes)
+            )
+        
+        elif model_name == "convnext_base":
+            if use_pretrained:
+                self.backbone = models.convnext_base(
+                    weights=ConvNeXt_Base_Weights.IMAGENET1K_V1,
+                    stochastic_depth_prob=stochastic_depth
+                )
+            else:
+                self.backbone = models.convnext_base(
+                    weights=None,
+                    stochastic_depth_prob=stochastic_depth
+                )
+            
+            in_features = self.backbone.classifier[2].in_features
+            self.backbone.classifier = nn.Sequential(
+                nn.Flatten(1),
+                nn.LayerNorm(in_features),
+                nn.Linear(in_features, in_features // 2),
+                nn.GELU(),
+                nn.Dropout(p=0.35),
+                nn.Linear(in_features // 2, num_classes)
+            )
+            
+        elif model_name == "efficientnet_b7":
+            if use_pretrained:
+                self.backbone = models.efficientnet_b7(weights=EfficientNet_B7_Weights.IMAGENET1K_V1)
+            else:
+                self.backbone = models.efficientnet_b7(weights=None)
+            
+            in_features = self.backbone.classifier[1].in_features
+            self.backbone.classifier = nn.Sequential(
+                nn.Dropout(p=0.5, inplace=True),
+                nn.Linear(in_features, num_classes)
+            )
         else:
-            self.backbone = models.efficientnet_b7(weights=None)
-        
-        in_features = self.backbone.classifier[1].in_features
-        
-        # ✅ 使用简单的分类头（不要过度复杂化）
-        self.backbone.classifier = nn.Sequential(
-            nn.Dropout(p=0.5, inplace=True),
-            nn.Linear(in_features, num_classes)
-        )
+            raise ValueError(f"Unsupported model: {model_name}")
     
     def forward(self, x):
         return self.backbone(x)
 
+
 def build_model(config):
-    num_classes = config.get("num_classes", 100)
-    use_pretrained = config.get("use_pretrained", True)
-    model = Mymodel(num_classes=num_classes, use_pretrained=use_pretrained)
-    return model
-
-
-
-
-
-
+    return Mymodel(
+        num_classes=config.get("num_classes", 152),
+        use_pretrained=config.get("use_pretrained", True),
+        model_name=config.get("model_name", "convnext_base"),
+        stochastic_depth=config.get("stochastic_depth", 0.0)
+    )

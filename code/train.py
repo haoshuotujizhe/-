@@ -1,15 +1,17 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import os
 import math
 import random
 import json
+import shutil
 import torch.optim as optim
 from tqdm import tqdm
 import numpy as np
 import copy
 import sys
-# 兼容新旧 AMP API
+
 try:
     from torch.amp import autocast, GradScaler
     AMP_HAS_DEVICE = True
@@ -17,11 +19,11 @@ except ImportError:
     from torch.cuda.amp import autocast, GradScaler
     AMP_HAS_DEVICE = False
 
-
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from model import build_model
-from utils import get_dataloaders, save_model, set_seed
+from utils import get_dataloaders, save_model, set_seed, compute_class_weights, CATEGORY_IDS
+
 
 def rand_bbox(W, H, lam):
     cut_rat = math.sqrt(1. - lam)
@@ -31,8 +33,8 @@ def rand_bbox(W, H, lam):
     x2, y2 = np.clip(cx + cut_w // 2, 0, W), np.clip(cy + cut_h // 2, 0, H)
     return x1, y1, x2, y2
 
+
 def apply_mixup_cutmix(images, targets, use_mixup, mixup_alpha, use_cutmix, cutmix_alpha):
-    """返回 (images, (y_a, y_b, lam)) 或 (images, (targets, None, 1.0))"""
     if use_cutmix and cutmix_alpha > 0 and random.random() < 0.5:
         lam = np.random.beta(cutmix_alpha, cutmix_alpha)
         batch_size, _, H, W = images.size()
@@ -43,163 +45,158 @@ def apply_mixup_cutmix(images, targets, use_mixup, mixup_alpha, use_cutmix, cutm
         return images, (targets, targets[index], lam)
     if use_mixup and mixup_alpha > 0:
         lam = np.random.beta(mixup_alpha, mixup_alpha)
-        batch_size = images.size(0)
-        index = torch.randperm(batch_size, device=images.device)
-        mixed = lam * images + (1 - lam) * images[index, :]
+        index = torch.randperm(images.size(0), device=images.device)
+        mixed = lam * images + (1 - lam) * images[index]
         return mixed, (targets, targets[index], lam)
     return images, (targets, None, 1.0)
 
+
 class ModelEMA:
     def __init__(self, model, decay=0.9999, device=None):
-        self.ema = copy_model(model)
+        self.ema = copy.deepcopy(model)
         self.ema.eval()
         for p in self.ema.parameters():
             p.requires_grad_(False)
         self.decay = decay
-        self.device = device
-        if device is not None:
+        if device:
             self.ema = self.ema.to(device)
 
     @torch.no_grad()
     def update(self, model):
-        # ✅ 同步参数 + BN buffers
-        d = self.decay
-        msd = model.state_dict()
-        esd = self.ema.state_dict()
+        msd, esd = model.state_dict(), self.ema.state_dict()
         for k in esd.keys():
-            if not torch.is_floating_point(esd[k]):
-                esd[k].copy_(msd[k])
-            else:
-                if ("running_mean" in k) or ("running_var" in k):
+            if torch.is_floating_point(esd[k]):
+                if "running" in k:
                     esd[k].copy_(msd[k])
                 else:
-                    esd[k].mul_(d).add_(msd[k], alpha=1.0 - d)
+                    esd[k].mul_(self.decay).add_(msd[k], alpha=1-self.decay)
+            else:
+                esd[k].copy_(msd[k])
 
-def copy_model(model):
-    import copy
-    m = copy.deepcopy(model)
-    return m
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler=None, use_amp=False, max_grad_norm=1.0, 
-                    aug_cfg=None, ema=None, amp_dtype=torch.float16):
+class LabelSmoothingCE(nn.Module):
+    def __init__(self, smoothing=0.1, weight=None):
+        super().__init__()
+        self.smoothing = smoothing
+        self.weight = weight
+    
+    def forward(self, pred, target):
+        n = pred.size(-1)
+        log_p = F.log_softmax(pred, dim=-1)
+        
+        with torch.no_grad():
+            true_dist = torch.zeros_like(log_p)
+            true_dist.fill_(self.smoothing / (n - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+        
+        loss = -true_dist * log_p
+        if self.weight is not None:
+            loss = loss * self.weight[target].unsqueeze(1)
+        
+        return loss.sum(dim=-1).mean()
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler, use_amp, aug_cfg, ema, amp_dtype):
     model.train()
-    # ✅ Phase 3 需要保持 BN 冻结
     total_loss, total_correct, total = 0, 0, 0
-    for imgs, labels in tqdm(dataloader, desc="Training", leave=False):
-        imgs, labels = imgs.to(device,non_blocking=True), labels.to(device,non_blocking=True)
-        original_labels = labels.clone()
+    
+    for imgs, labels in tqdm(loader, desc="Training", leave=False):
+        imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        
+        if imgs.device.type == 'cuda':
+            imgs = imgs.to(memory_format=torch.channels_last)
+        
+        orig_labels = labels.clone()
         imgs, (y_a, y_b, lam) = apply_mixup_cutmix(
             imgs, labels,
-            use_mixup=aug_cfg.get("use_mixup", False)if aug_cfg else False,
-            mixup_alpha=aug_cfg.get("mixup_alpha", 0.0)if aug_cfg else 0.0,
-            use_cutmix=aug_cfg.get("use_cutmix", False)if aug_cfg else False,
-            cutmix_alpha=aug_cfg.get("cutmix_alpha", 0.0)if aug_cfg else 0.0
+            aug_cfg.get("use_mixup", False), aug_cfg.get("mixup_alpha", 0),
+            aug_cfg.get("use_cutmix", False), aug_cfg.get("cutmix_alpha", 0)
         )
+        
         optimizer.zero_grad(set_to_none=True)
-        if AMP_HAS_DEVICE:
-            with autocast(device_type="cuda",dtype=amp_dtype,enabled=use_amp):
-                outputs = model(imgs)
-                if y_b is None:
-                    loss = criterion(outputs, y_a)
-                else:
-                    loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(outputs, y_b)
-        else:
-            with autocast(enabled=use_amp):
-                outputs = model(imgs)
-                if y_b is None:
-                    loss = criterion(outputs, y_a)
-                else:
-                    loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(outputs, y_b)
-
-        if use_amp and scaler is not None:
+        
+        ctx = autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp) if AMP_HAS_DEVICE else autocast(enabled=use_amp)
+        with ctx:
+            out = model(imgs)
+            loss = criterion(out, y_a) if y_b is None else lam * criterion(out, y_a) + (1-lam) * criterion(out, y_b)
+        
+        if use_amp and scaler:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-
-        if ema is not None:
+        
+        if ema:
             ema.update(model)
-
+        
         total_loss += loss.item() * imgs.size(0)
-        _, preds = torch.max(outputs, 1)
-        total_correct += (preds == original_labels).sum().item()  
+        _, preds = out.max(1)
+        total_correct += (preds == orig_labels).sum().item()
         total += labels.size(0)
+    
     return total_loss / total, total_correct / total
 
-def validate(model, dataloader, criterion, device,use_amp=False, use_tta=False, amp_dtype=torch.float16):
+
+def validate(model, loader, criterion, device, use_amp, use_tta, amp_dtype):
     model.eval()
     total_loss, total_correct, total = 0, 0, 0
+    
     with torch.no_grad():
-        for imgs, labels in tqdm(dataloader, desc="Validating", leave=False):
+        for imgs, labels in tqdm(loader, desc="Validating", leave=False):
             imgs, labels = imgs.to(device), labels.to(device)
             
-            if use_tta:
-                # ✅ 花朵识别：只用水平翻转
-                imgs_h = torch.flip(imgs, dims=[3])
-                
-                if AMP_HAS_DEVICE:
-                    with autocast(device_type="cuda",dtype=amp_dtype,enabled=use_amp):
-                        out1 = model(imgs)
-                        out2 = model(imgs_h)
-                        outputs = (out1 + out2) / 2.0
-                        loss = criterion(outputs, labels)
+            if imgs.device.type == 'cuda':
+                imgs = imgs.to(memory_format=torch.channels_last)
+            
+            ctx = autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp) if AMP_HAS_DEVICE else autocast(enabled=use_amp)
+            
+            with ctx:
+                if use_tta:
+                    out1 = model(imgs)
+                    out2 = model(torch.flip(imgs, [3]))
+                    out3 = model(torch.flip(imgs, [2]))
+                    out = (out1 + out2 + out3) / 3
                 else:
-                    with autocast(enabled=use_amp):
-                        out1 = model(imgs)
-                        out2 = model(imgs_h)
-                        outputs = (out1 + out2) / 2.0
-                        loss = criterion(outputs, labels)
-            else:
-                if AMP_HAS_DEVICE:
-                    with autocast(device_type="cuda",dtype=amp_dtype,enabled=use_amp):
-                        outputs = model(imgs)
-                        loss = criterion(outputs, labels)
-                else:
-                    with autocast(enabled=use_amp):
-                        outputs = model(imgs)
-                        loss = criterion(outputs, labels)
-                    
+                    out = model(imgs)
+                loss = criterion(out, labels)
+            
             total_loss += loss.item() * imgs.size(0)
-            _, preds = torch.max(outputs, 1)
+            _, preds = out.max(1)
             total_correct += (preds == labels).sum().item()
             total += labels.size(0)
+    
     return total_loss / total, total_correct / total
 
-def set_trainable(module, flag: bool):
+
+def set_trainable(module, flag):
     for p in module.parameters():
         p.requires_grad_(flag)
 
-def build_optimizer(model, lr_backbone, lr_head, weight_decay=5e-4):
-    """判别式学习率 + 正确的权重衰减排除（bn/bias不衰减）"""
+
+def build_optimizer(model, lr_backbone, lr_head, wd=5e-4):
     decay, no_decay = [], []
-    for name, p in model.named_parameters():
+    for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.ndim == 1 or name.endswith(".bias"):
+        if p.ndim == 1 or "bias" in n or "norm" in n.lower():
             no_decay.append(p)
         else:
             decay.append(p)
-    # 分类头参数单独分组（更大学习率）
-    head_params = list(model.backbone.classifier.parameters())
-    head_id = set([id(p) for p in head_params])
-
-    decay_backbone = [p for p in decay if id(p) not in head_id]
-    no_decay_backbone = [p for p in no_decay if id(p) not in head_id]
-    decay_head = [p for p in decay if id(p) in head_id]
-    no_decay_head = [p for p in no_decay if id(p) in head_id]
-
-    param_groups = [
-        {"params": decay_backbone, "lr": lr_backbone, "weight_decay": weight_decay},
-        {"params": no_decay_backbone, "lr": lr_backbone, "weight_decay": 0.0},
-        {"params": decay_head, "lr": lr_head, "weight_decay": weight_decay},
-        {"params": no_decay_head, "lr": lr_head, "weight_decay": 0.0},
+    
+    head_params = set(id(p) for p in model.backbone.classifier.parameters())
+    
+    groups = [
+        {"params": [p for p in decay if id(p) not in head_params], "lr": lr_backbone, "weight_decay": wd},
+        {"params": [p for p in no_decay if id(p) not in head_params], "lr": lr_backbone, "weight_decay": 0},
+        {"params": [p for p in decay if id(p) in head_params], "lr": lr_head, "weight_decay": wd},
+        {"params": [p for p in no_decay if id(p) in head_params], "lr": lr_head, "weight_decay": 0},
     ]
-    return optim.AdamW(param_groups)
+    return optim.AdamW(groups)
 
 
 if __name__ == "__main__":
@@ -207,28 +204,22 @@ if __name__ == "__main__":
     with open(config_path, "r") as f:
         config = json.load(f)
     
-    # ✅ 启用 TF32
-    if bool(config.get("allow_tf32", True)):
+    # 一致性检查
+    if config["num_classes"] != len(CATEGORY_IDS):
+        raise ValueError(f"num_classes({config['num_classes']}) != len(CATEGORY_IDS)({len(CATEGORY_IDS)})")
+    print(f"✅ 类别数检查: {config['num_classes']}")
+    
+    if config.get("allow_tf32", True):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     
-    # 将配置中的相对路径转换为绝对路径
     parent_dir = os.path.dirname(os.path.dirname(__file__))
-    def resolve_path(path):
-        if os.path.isabs(path):
-            return path
-        return os.path.abspath(os.path.join(parent_dir, path))
+    resolve = lambda p: p if os.path.isabs(p) else os.path.abspath(os.path.join(parent_dir, p))
     
-    config["train_dir"] = resolve_path(config["train_dir"])
-    config["val_dir"] = resolve_path(config["val_dir"])
-    config["test_dir"] = resolve_path(config["test_dir"])
-    config["train_label_csv"] = resolve_path(config["train_label_csv"])
+    config["train_dir"] = resolve(config["train_dir"])
+    config["val_dir"] = resolve(config["val_dir"])
+    config["train_label_csv"] = resolve(config["train_label_csv"])
     
-    print("Resolved paths:")
-    print(f"  train_dir: {config['train_dir']}")
-    print(f"  val_dir: {config['val_dir']}")
-    print(f"  train_label_csv: {config['train_label_csv']}")
-
     set_seed(42)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -236,179 +227,162 @@ if __name__ == "__main__":
     amp_dtype = torch.float16
     
     # 数据加载
-    train_loader, val_loader = get_dataloaders(
-        train_dir=config["train_dir"],
-        train_label_csv=config["train_label_csv"],
-        val_dir=config["val_dir"],
-        config=config
+    train_loader, val_loader, class_counts = get_dataloaders(
+        config["train_dir"], config["train_label_csv"], config["val_dir"], config
     )
-    
-    # 读取策略配置
-    head_epochs = int(config.get("head_epochs", 0))
-    lr_backbone = float(config.get("lr_backbone", config["learning_rate"]))
-    lr_head = float(config.get("lr_head", config["learning_rate"]))
     
     # 模型
     model = build_model(config)
-    # ✅ channels_last
-    if bool(config.get("channels_last", True)):
-        model = model.to(device, memory_format=torch.channels_last)
-    else:
-        model = model.to(device)
+    model = model.to(device, memory_format=torch.channels_last) if config.get("channels_last") else model.to(device)
     
-    # ✅ 更强的正则化
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.015)  # 从 0.01 → 0.015
+    # 类别权重
+    class_weights = None
+    if config.get("use_class_weight_loss"):
+        class_weights = compute_class_weights(class_counts, config["num_classes"]).to(device)
+        print(f"✅ 类别权重: {class_weights.min():.2f} ~ {class_weights.max():.2f}")
     
-    ema = None
+    # 损失函数
+    smoothing = config.get("label_smoothing", 0.05)
+    criterion = LabelSmoothingCE(smoothing=smoothing, weight=class_weights)
     
-    # 定义增强配置
-    aug_cfg_phase1 = {
-        "use_mixup": False,
-        "mixup_alpha": 0.0,
-        "use_cutmix": False,
-        "cutmix_alpha": 0.0,
-    }
-    
-    aug_cfg_phase2 = {
-        "use_mixup": bool(config.get("use_mixup", False)),
-        "mixup_alpha": float(config.get("mixup_alpha", 0.0)),
-        "use_cutmix": bool(config.get("use_cutmix", False)),
-        "cutmix_alpha": float(config.get("cutmix_alpha", 0.0)),
-    }
-    
-    print(f"✅ 增强配置已设置:")
-    print(f"   Phase 1 - Mixup: {aug_cfg_phase1['use_mixup']}, CutMix: {aug_cfg_phase1['use_cutmix']}")
-    print(f"   Phase 2 - Mixup: {aug_cfg_phase2['use_mixup']}, CutMix: {aug_cfg_phase2['use_cutmix']}")
-    print(f"   Label Smoothing: 0.01")
-
-    model_save_dir = "../submission/models"
+    model_save_dir = os.path.join(parent_dir, "submission/models")
     os.makedirs(model_save_dir, exist_ok=True)
     scaler = GradScaler(enabled=use_amp)
-
-    # Phase 1
+    
+    head_epochs = config.get("head_epochs", 12)
+    lr_backbone = config.get("lr_backbone", 0.000015)
+    lr_head = config.get("lr_head", 0.00012)
+    
+    aug_off = {"use_mixup": False, "mixup_alpha": 0, "use_cutmix": False, "cutmix_alpha": 0}
+    aug_on = {
+        "use_mixup": config.get("use_mixup", True),
+        "mixup_alpha": config.get("mixup_alpha", 0.2),
+        "use_cutmix": config.get("use_cutmix", True),
+        "cutmix_alpha": config.get("cutmix_alpha", 0.35)
+    }
+    
+    # ========== Phase 1 ==========
     if head_epochs > 0:
-        print(f"\n=== Phase 1: Train classifier only for {head_epochs} epochs ===")
-        print("⚠️  Phase 1 不使用 EMA（分类头从零开始训练）")
+        print(f"\n{'='*50}\n=== Phase 1: Head Only ({head_epochs} epochs) ===\n{'='*50}")
         
-        set_trainable(model.backbone.features, False)
+        set_trainable(model, False)
         set_trainable(model.backbone.classifier, True)
         
-        optimizer = build_optimizer(model, lr_backbone=0.0, lr_head=lr_head, weight_decay=2e-4)  # 从 1e-4 → 2e-4
+        opt = build_optimizer(model, 0, lr_head, 2e-4)
+        best_acc = 0
+        p1_path = os.path.join(model_save_dir, "phase1_best.pth")
         
-        best_acc = 0.0
-        phase1_model_path = os.path.join(model_save_dir, "phase1_best.pth")
-        
-        for epoch in range(head_epochs):
-            print(f"\n[Phase1] Epoch {epoch+1}/{head_epochs}")
-            train_loss, train_acc = train_one_epoch(
-                model, train_loader, criterion, optimizer, device,
-                scaler, use_amp, aug_cfg=aug_cfg_phase1, ema=None, amp_dtype=amp_dtype
-            )
-            val_loss, val_acc = validate(model, val_loader, criterion, device, use_amp, 
-                                        use_tta=False, amp_dtype=amp_dtype)
-            print(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+        for ep in range(head_epochs):
+            print(f"\n[P1] Epoch {ep+1}/{head_epochs}")
+            t_loss, t_acc = train_one_epoch(model, train_loader, criterion, opt, device, scaler, use_amp, aug_off, None, amp_dtype)
+            v_loss, v_acc = validate(model, val_loader, criterion, device, use_amp, False, amp_dtype)
+            print(f"Train: {t_loss:.4f}/{t_acc:.4f} | Val: {v_loss:.4f}/{v_acc:.4f}")
             
-            if val_acc > best_acc:
-                best_acc = val_acc
-                save_model(model, phase1_model_path)
-                print("✅ Saved new best model (Phase1)")
+            if v_acc > best_acc:
+                best_acc = v_acc
+                save_model(model, p1_path)
+                print("✅ Saved P1 best")
         
-        print(f"\nLoading Phase1 best model (Val Acc: {best_acc:.4f})")
-        if best_acc < 0.75:
-            print("⚠️ Phase 1 准确率过低，考虑增加 head_epochs 或调整学习率")
-        model.load_state_dict(torch.load(phase1_model_path, map_location=device))
-
-    # Phase 2
-    print("\n=== Phase 2: Fine-tune full network ===")
-    print("🔄 重新加载训练数据（使用强增强）...")
+        model.load_state_dict(torch.load(p1_path, map_location=device))
+        print(f"P1 Best: {best_acc:.4f}")
     
-    train_loader, _ = get_dataloaders(
-        train_dir=config["train_dir"],
-        train_label_csv=config["train_label_csv"],
-        val_dir=config["val_dir"],
-        config=config,
-        use_strong_aug=True
+    # ========== Phase 2 ==========
+    print(f"\n{'='*50}\n=== Phase 2: Full Fine-tune ({config['epochs']} epochs) ===\n{'='*50}")
+    
+    train_loader, _, _ = get_dataloaders(
+        config["train_dir"], config["train_label_csv"], config["val_dir"], config, use_strong_aug=True
     )
     
-    if config.get("use_ema", False):
-        print("✅ 初始化 EMA（Phase 2）")
-        ema = ModelEMA(model, decay=float(config.get("ema_decay", 0.9999)), device=device)
-    
     set_trainable(model, True)
+    ema = ModelEMA(model, config.get("ema_decay", 0.99995), device) if config.get("use_ema") else None
     
-    optimizer = build_optimizer(model, lr_backbone=lr_backbone, lr_head=lr_head, weight_decay=5e-4)
+    opt = build_optimizer(model, lr_backbone, lr_head)
+    
     from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
+    warmup_ep = config.get("warmup_epochs", 5)
+    warmup_sched = LambdaLR(opt, lambda e: (e+1)/warmup_ep if e < warmup_ep else 1.0)
+    cosine_sched = CosineAnnealingLR(opt, T_max=config["epochs"], eta_min=config.get("min_lr", 1e-7))
     
-    def warmup_lambda(epoch):
-        return (epoch + 1) / 3 if epoch < 3 else 1.0
-
-    warmup_scheduler = LambdaLR(optimizer, lr_lambda=warmup_lambda)
-    # ✅ 单调余弦退火（不重启）
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=int(config["epochs"]), eta_min=1e-8)
-
-    best_acc = 0.0
-    patience_counter = 0
-    max_patience = 20  # 从 12 → 20
-    min_epochs = 50    # 从 35 → 50（确保充分训练）
-    min_delta = 1e-5   # 从 5e-5 → 1e-5（更敏感）
-    best_model_path = os.path.join(model_save_dir, "best_model.pth")
-
-    tta_val_every = int(config.get("tta_val_every", 5))
-    # ✅ 数据完美，可以更早关闭增强
-    turn_off_cutmix_epoch = 18  # epoch 18 关闭 CutMix
-    turn_off_mixup_epoch = 30   # epoch 30 关闭 Mixup
-    turn_off_all_aug_epoch = 999  # 永远保持基础增强
+    best_acc = 0
+    patience = 0
+    max_patience = 25
+    best_path = os.path.join(model_save_dir, "best_model.pth")
     
-    for epoch in range(config["epochs"]):
-        current_lr = optimizer.param_groups[0]['lr'] * warmup_lambda(epoch) if epoch < 3 else optimizer.param_groups[0]['lr']
-        print(f"\n[Phase2] Epoch {epoch+1}/{config['epochs']} LR: {current_lr:.6f}")
+    for ep in range(config["epochs"]):
+        lr_now = opt.param_groups[0]['lr']
+        print(f"\n[P2] Epoch {ep+1}/{config['epochs']} LR: {lr_now:.2e}")
         
-        cur_aug = dict(aug_cfg_phase2)
-        if epoch >= turn_off_cutmix_epoch:
-            cur_aug.update({"use_cutmix": False, "mixup_alpha": 0.15})
-            if epoch == turn_off_cutmix_epoch:
-                print("   📉 关闭 CutMix，保持 Mixup alpha=0.15")
+        # 动态关闭增强
+        cur_aug = dict(aug_on)
+        if ep >= 20:
+            cur_aug["use_cutmix"] = False
+        if ep >= 35:
+            cur_aug["use_mixup"] = False
         
-        if epoch >= turn_off_mixup_epoch:
-            cur_aug.update({"use_cutmix": False, "mixup_alpha": 0.0, "use_mixup": False})
-            if epoch == turn_off_mixup_epoch:
-                print("   📴 关闭所有混合增强，开始最终收敛")
+        t_loss, t_acc = train_one_epoch(model, train_loader, criterion, opt, device, scaler, use_amp, cur_aug, ema, amp_dtype)
         
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device,
-            scaler, use_amp, aug_cfg=cur_aug, ema=ema, amp_dtype=amp_dtype
+        eval_m = ema.ema if ema else model
+        use_tta = (ep+1) % config.get("tta_val_every", 3) == 0 or ep >= config["epochs"] - 5
+        v_loss, v_acc = validate(eval_m, val_loader, criterion, device, use_amp, use_tta, amp_dtype)
+        
+        print(f"Train: {t_loss:.4f}/{t_acc:.4f} | Val: {v_loss:.4f}/{v_acc:.4f} | Gap: {abs(t_acc-v_acc):.4f}")
+        
+        (warmup_sched if ep < warmup_ep else cosine_sched).step()
+        
+        if v_acc > best_acc + 1e-5:
+            best_acc = v_acc
+            patience = 0
+            save_model(eval_m, best_path)
+            print("✅ Saved best!")
+        else:
+            patience += 1
+            if patience >= max_patience and ep >= 50:
+                print("⏹ Early stop")
+                break
+    
+    print(f"\nP2 Best: {best_acc:.4f}")
+    
+    # ========== Phase 3 ==========
+    if config.get("final_finetune"):
+        print(f"\n{'='*50}\n=== Phase 3: High-Res Fine-tune ===\n{'='*50}")
+        
+        model.load_state_dict(torch.load(best_path, map_location=device))
+        if ema:
+            ema = ModelEMA(model, config.get("ema_decay", 0.99995), device)
+        
+        config["input_size"] = config.get("final_finetune_size", [576, 576])
+        train_loader, val_loader, _ = get_dataloaders(
+            config["train_dir"], config["train_label_csv"], config["val_dir"], config, use_strong_aug=False
         )
         
-        eval_model = ema.ema if ema is not None else model
-        if ema is not None:
-            for (n, b_ema) in eval_model.named_buffers():
-                b_model = dict(model.named_buffers())[n]
-                b_ema.copy_(b_model)
+        opt = build_optimizer(model, lr_backbone * 0.1, lr_head * 0.1, 1e-4)
+        p3_epochs = config.get("final_finetune_epochs", 25)
+        sched = CosineAnnealingLR(opt, T_max=p3_epochs, eta_min=1e-8)
         
-        use_tta_val = ((epoch + 1) % tta_val_every == 0) or ((epoch + 1) >= config["epochs"] - 5)
-        if use_tta_val:
-            print("   🔍 使用 TTA 验证...")
+        criterion_p3 = nn.CrossEntropyLoss()
+        p3_best = best_acc
         
-        val_loss, val_acc = validate(eval_model, val_loader, criterion, device, use_amp, 
-                                    use_tta=use_tta_val, amp_dtype=amp_dtype)
+        for ep in range(p3_epochs):
+            print(f"\n[P3] Epoch {ep+1}/{p3_epochs}")
+            t_loss, t_acc = train_one_epoch(model, train_loader, criterion_p3, opt, device, scaler, use_amp, aug_off, ema, amp_dtype)
+            eval_m = ema.ema if ema else model
+            v_loss, v_acc = validate(eval_m, val_loader, criterion_p3, device, use_amp, True, amp_dtype)
+            print(f"Train: {t_loss:.4f}/{t_acc:.4f} | Val: {v_loss:.4f}/{v_acc:.4f}")
+            sched.step()
+            
+            if v_acc > p3_best + 1e-5:
+                p3_best = v_acc
+                save_model(eval_m, best_path)
+                print("✅ Saved P3 best!")
         
-        # ✅ 显示训练和验证的差距
-        gap = abs(train_acc - val_acc)
-        print(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f} | Gap: {gap:.4f}")
-        
-        (warmup_scheduler if epoch < 3 else cosine_scheduler).step()
-        
-        if val_acc > best_acc + min_delta:
-            best_acc = val_acc
-            patience_counter = 0
-            save_model(eval_model, best_model_path)
-            print("✅ Saved new best model!")
-        else:
-            patience_counter += 1
-            print(f"⚠️ No improvement for {patience_counter}/{max_patience} epochs")
-        
-        if (epoch + 1) >= min_epochs and patience_counter >= max_patience:
-            print("Early stopping triggered")
-            break
+        best_acc = p3_best
     
-    print(f"\n🎉 Final Best Val Accuracy: {best_acc:.4f}")
+    # 复制到 model/
+    final_path = os.path.join(parent_dir, "model", "best_model.pth")
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    shutil.copy(best_path, final_path)
+    
+    print(f"\n{'='*50}")
+    print(f"🏆 训练完成! Best: {best_acc:.4f}")
+    print(f"模型: {final_path}")
+    print(f"{'='*50}")
