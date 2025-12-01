@@ -150,7 +150,7 @@ def main():
     results = []
     processed_count = 0
     
-    print(f"开始处理 {len(imgs)} 张图片，批量大小: {batch_size}")
+    # print(f"开始处理 {len(imgs)} 张图片，批量大小: {batch_size}")
     
     for i in range(0, len(imgs), batch_size):
         batch_paths = imgs[i:i+batch_size]
@@ -179,7 +179,7 @@ def main():
                 })
                 
             processed_count += len(valid_paths)
-            print(f"进度: {processed_count}/{len(imgs)} ({(processed_count/len(imgs)*100):.1f}%)")
+            # print(f"进度: {processed_count}/{len(imgs)} ({(processed_count/len(imgs)*100):.1f}%)")
             
         except Exception as e:
             print(f"批量推理出错: {e}")
@@ -198,8 +198,28 @@ def main():
                         "confidence": round(conf, 6)
                     })
                 except Exception as e2:
-                    print(f"回退处理失败 {path.name}: {e2}")
+                    # print(f"回退处理失败 {path.name}: {e2}")
                     continue
     
     Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(results).to_csv(args.output_path, index=False)
+    
+    # 创建 DataFrame 并确保列顺序正确
+    df = pd.DataFrame(results)
+    
+    # 确保列顺序严格一致
+    df = df[['filename', 'category_id', 'confidence']]
+    
+    # 确保 category_id 是整数类型
+    df['category_id'] = df['category_id'].astype(int)
+    
+    # 确保 confidence 是浮点数，保留4位小数
+    df['confidence'] = df['confidence'].round(4)
+    
+    # 保存为 UTF-8 编码的 CSV，不带 BOM
+    df.to_csv(args.output_path, index=False, encoding='utf-8')
+    
+    # print(f"结果已保存到 {args.output_path}，共 {len(df)} 条记录")
+
+
+if __name__ == "__main__":
+    main()
