@@ -96,6 +96,42 @@ class LabelSmoothingCE(nn.Module):
         return loss.sum(dim=-1).mean()
 
 
+class EarlyStopping:
+    """早停机制"""
+    def __init__(self, patience=10, min_delta=1e-5, min_epochs=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.min_epochs = min_epochs  # 最少训练轮数
+        self.best_score = None
+        self.counter = 0
+        self.should_stop = False
+    
+    def __call__(self, score, epoch):
+        if epoch < self.min_epochs:
+            # 未达到最少轮数，只更新 best_score
+            if self.best_score is None or score > self.best_score + self.min_delta:
+                self.best_score = score
+            return False
+        
+        if self.best_score is None:
+            self.best_score = score
+        elif score > self.best_score + self.min_delta:
+            self.best_score = score
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+        
+        return self.should_stop
+    
+    def reset(self, keep_best=False):
+        if not keep_best:
+            self.best_score = None
+        self.counter = 0
+        self.should_stop = False
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device, scaler, use_amp, aug_cfg, ema, amp_dtype):
     model.train()
     total_loss, total_correct, total = 0, 0, 0
@@ -207,7 +243,7 @@ if __name__ == "__main__":
     # 一致性检查
     if config["num_classes"] != len(CATEGORY_IDS):
         raise ValueError(f"num_classes({config['num_classes']}) != len(CATEGORY_IDS)({len(CATEGORY_IDS)})")
-    print(f"✅ 类别数检查: {config['num_classes']}")
+    print(f"类别数检查: {config['num_classes']}")
     
     if config.get("allow_tf32", True):
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -239,7 +275,7 @@ if __name__ == "__main__":
     class_weights = None
     if config.get("use_class_weight_loss"):
         class_weights = compute_class_weights(class_counts, config["num_classes"]).to(device)
-        print(f"✅ 类别权重: {class_weights.min():.2f} ~ {class_weights.max():.2f}")
+        print(f"类别权重: {class_weights.min():.2f} ~ {class_weights.max():.2f}")
     
     # 损失函数
     smoothing = config.get("label_smoothing", 0.05)
@@ -261,9 +297,14 @@ if __name__ == "__main__":
         "cutmix_alpha": config.get("cutmix_alpha", 0.35)
     }
     
+    # 早停配置
+    p1_patience = config.get("p1_patience", 5)      # Phase 1 耐心
+    p2_patience = config.get("p2_patience", 15)     # Phase 2 耐心
+    p3_patience = config.get("p3_patience", 8)      # Phase 3 耐心
+    
     # ========== Phase 1 ==========
     if head_epochs > 0:
-        print(f"\n{'='*50}\n=== Phase 1: Head Only ({head_epochs} epochs) ===\n{'='*50}")
+        print(f"\n{'='*50}\n=== Phase 1: Head Only ({head_epochs} epochs, patience={p1_patience}) ===\n{'='*50}")
         
         set_trainable(model, False)
         set_trainable(model.backbone.classifier, True)
@@ -271,6 +312,9 @@ if __name__ == "__main__":
         opt = build_optimizer(model, 0, lr_head, 2e-4)
         best_acc = 0
         p1_path = os.path.join(model_save_dir, "phase1_best.pth")
+        
+        # Phase 1 早停
+        early_stop_p1 = EarlyStopping(patience=p1_patience, min_delta=1e-4, min_epochs=3)
         
         for ep in range(head_epochs):
             print(f"\n[P1] Epoch {ep+1}/{head_epochs}")
@@ -281,13 +325,18 @@ if __name__ == "__main__":
             if v_acc > best_acc:
                 best_acc = v_acc
                 save_model(model, p1_path)
-                print("✅ Saved P1 best")
+                print("Saved P1 best")
+            
+            # 检查早停
+            if early_stop_p1(v_acc, ep):
+                print(f"P1 Early stop at epoch {ep+1}")
+                break
         
         model.load_state_dict(torch.load(p1_path, map_location=device))
         print(f"P1 Best: {best_acc:.4f}")
     
     # ========== Phase 2 ==========
-    print(f"\n{'='*50}\n=== Phase 2: Full Fine-tune ({config['epochs']} epochs) ===\n{'='*50}")
+    print(f"\n{'='*50}\n=== Phase 2: Full Fine-tune ({config['epochs']} epochs, patience={p2_patience}) ===\n{'='*50}")
     
     train_loader, _, _ = get_dataloaders(
         config["train_dir"], config["train_label_csv"], config["val_dir"], config, use_strong_aug=True
@@ -304,13 +353,14 @@ if __name__ == "__main__":
     cosine_sched = CosineAnnealingLR(opt, T_max=config["epochs"], eta_min=config.get("min_lr", 1e-7))
     
     best_acc = 0
-    patience = 0
-    max_patience = 25
     best_path = os.path.join(model_save_dir, "best_model.pth")
+    
+    # Phase 2 早停
+    early_stop_p2 = EarlyStopping(patience=p2_patience, min_delta=1e-5, min_epochs=20)
     
     for ep in range(config["epochs"]):
         lr_now = opt.param_groups[0]['lr']
-        print(f"\n[P2] Epoch {ep+1}/{config['epochs']} LR: {lr_now:.2e}")
+        print(f"\n[P2] Epoch {ep+1}/{config['epochs']} LR: {lr_now:.2e} (no_improve: {early_stop_p2.counter}/{p2_patience})")
         
         # 动态关闭增强
         cur_aug = dict(aug_on)
@@ -331,20 +381,19 @@ if __name__ == "__main__":
         
         if v_acc > best_acc + 1e-5:
             best_acc = v_acc
-            patience = 0
             save_model(eval_m, best_path)
-            print("✅ Saved best!")
-        else:
-            patience += 1
-            if patience >= max_patience and ep >= 50:
-                print("⏹ Early stop")
-                break
+            print("Saved best!")
+        
+        # 检查早停
+        if early_stop_p2(v_acc, ep):
+            print(f"⏹ P2 Early stop at epoch {ep+1}")
+            break
     
     print(f"\nP2 Best: {best_acc:.4f}")
     
     # ========== Phase 3 ==========
     if config.get("final_finetune"):
-        print(f"\n{'='*50}\n=== Phase 3: High-Res Fine-tune ===\n{'='*50}")
+        print(f"\n{'='*50}\n=== Phase 3: High-Res Fine-tune (patience={p3_patience}) ===\n{'='*50}")
         
         model.load_state_dict(torch.load(best_path, map_location=device))
         if ema:
@@ -362,8 +411,11 @@ if __name__ == "__main__":
         criterion_p3 = nn.CrossEntropyLoss()
         p3_best = best_acc
         
+        # Phase 3 早停
+        early_stop_p3 = EarlyStopping(patience=p3_patience, min_delta=1e-5, min_epochs=5)
+        
         for ep in range(p3_epochs):
-            print(f"\n[P3] Epoch {ep+1}/{p3_epochs}")
+            print(f"\n[P3] Epoch {ep+1}/{p3_epochs} (no_improve: {early_stop_p3.counter}/{p3_patience})")
             t_loss, t_acc = train_one_epoch(model, train_loader, criterion_p3, opt, device, scaler, use_amp, aug_off, ema, amp_dtype)
             eval_m = ema.ema if ema else model
             v_loss, v_acc = validate(eval_m, val_loader, criterion_p3, device, use_amp, True, amp_dtype)
@@ -373,7 +425,12 @@ if __name__ == "__main__":
             if v_acc > p3_best + 1e-5:
                 p3_best = v_acc
                 save_model(eval_m, best_path)
-                print("✅ Saved P3 best!")
+                print("Saved P3 best!")
+            
+            # 检查早停
+            if early_stop_p3(v_acc, ep):
+                print(f"P3 Early stop at epoch {ep+1}")
+                break
         
         best_acc = p3_best
     
@@ -383,6 +440,6 @@ if __name__ == "__main__":
     shutil.copy(best_path, final_path)
     
     print(f"\n{'='*50}")
-    print(f"🏆 训练完成! Best: {best_acc:.4f}")
+    print(f"训练完成! Best: {best_acc:.4f}")
     print(f"模型: {final_path}")
     print(f"{'='*50}")

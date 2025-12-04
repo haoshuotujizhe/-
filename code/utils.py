@@ -8,10 +8,10 @@ import random
 import numpy as np
 from collections import Counter
 
-# ✅ 允许加载截断的图片
+# 允许加载截断的图片
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# ✅ 硬编码 152 个类别（与 predict.py 完全一致）
+# 硬编码 152 个类别（与 predict.py 完全一致）
 CATEGORY_IDS = [
     164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180,
     181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 192, 193, 194, 195, 196, 197, 198, 199,
@@ -25,7 +25,7 @@ CATEGORY_IDS = [
     1818, 1827, 1833
 ]
 
-# 固定映射：category_id → index
+# 固定映射：category_id→index
 CATEGORY_TO_INDEX = {cat_id: idx for idx, cat_id in enumerate(CATEGORY_IDS)}
 
 
@@ -95,7 +95,7 @@ class CSVBaseDataset(Dataset):
             
             img_path = os.path.join(img_dir, all_filenames[i])
             
-            # ✅ 验证图片（可选，首次运行建议开启）
+            # 验证图片
             if verify_images:
                 if not verify_image(img_path):
                     skipped_img += 1
@@ -106,9 +106,9 @@ class CSVBaseDataset(Dataset):
             self.integer_labels.append(self.label_mapping[cat_id])
         
         if skipped_cat > 0:
-            print(f"⚠️ 跳过 {skipped_cat} 个不在 CATEGORY_IDS 中的样本")
+            print(f"跳过 {skipped_cat} 个不在 CATEGORY_IDS 中的样本")
         if skipped_img > 0:
-            print(f"⚠️ 跳过 {skipped_img} 个损坏的图片")
+            print(f"跳过 {skipped_img} 个损坏的图片")
         
         self.class_counts = Counter(self.integer_labels)
 
@@ -122,8 +122,8 @@ class CSVBaseDataset(Dataset):
         try:
             image = Image.open(img_path).convert("RGB")
         except Exception as e:
-            # ✅ 如果仍然出错，返回随机有效样本
-            print(f"⚠️ 加载失败 {img_path}: {e}")
+            # 如果仍然出错，返回随机有效样本
+            print(f"加载失败 {img_path}: {e}")
             new_idx = random.randint(0, len(self.filenames) - 1)
             return self.__getitem__(new_idx)
         
@@ -186,16 +186,16 @@ def get_dataloaders(train_dir, train_label_csv, val_dir, config, use_strong_aug=
         transforms.Normalize(mean, std)
     ])
 
-    # ✅ 首次加载时验证图片
-    print("🔍 验证训练集图片...")
+    # 首次加载时验证图片
+    print("验证训练集图片...")
     train_set = CSVBaseDataset(img_dir=train_dir, total_csv=train_label_csv, transform=train_tf, verify_images=True)
     
-    print(f"✅ 训练集: {len(train_set)} 样本, {len(train_set.class_counts)} 类别")
+    print(f"训练集: {len(train_set)} 样本, {len(train_set.class_counts)} 类别")
     print(f"   标签范围: {min(train_set.integer_labels)} ~ {max(train_set.integer_labels)}")
     
-    print("🔍 验证验证集图片...")
+    print("验证验证集图片...")
     val_set = CSVBaseDataset(img_dir=val_dir, total_csv=train_label_csv, transform=val_tf, verify_images=True)
-    print(f"✅ 验证集: {len(val_set)} 样本")
+    print(f"验证集: {len(val_set)} 样本")
 
     num_workers = int(config.get("num_workers", 8))
     persistent_workers = bool(config.get("persistent_workers", True)) and (num_workers > 0)
@@ -208,7 +208,7 @@ def get_dataloaders(train_dir, train_label_csv, val_dir, config, use_strong_aug=
             num_workers=num_workers, pin_memory=True,
             persistent_workers=persistent_workers, prefetch_factor=prefetch_factor, drop_last=True
         )
-        print("✅ 启用加权采样器")
+        print("启用加权采样器")
     else:
         train_loader = DataLoader(
             train_set, batch_size=config["batch_size"], shuffle=True,

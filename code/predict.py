@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 
-# ✅ 硬编码 152 个类别
+# 硬编码 152 个类别
 CATEGORY_IDS = [
     164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180,
     181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 192, 193, 194, 195, 196, 197, 198, 199,
@@ -55,7 +55,7 @@ def preprocess_batch(image_paths, size, mean, std):
             images.append(tf(img))
             valid_paths.append(path)
         except Exception as e:
-            print(f"跳过损坏图片 {path.name}: {e}")
+            # print(f"跳过损坏图片 {path.name}: {e}")
             continue
     
     if images:  # 确保列表不为空
@@ -64,22 +64,21 @@ def preprocess_batch(image_paths, size, mean, std):
         return torch.empty(0), []  # 返回空张量
 
 def predict_batch(model, imgs_batch, device, use_tta=True):
-    """批量预测（替代原predict函数）"""
+    """批量预测"""
     imgs_batch = imgs_batch.to(device)
     batch_size = imgs_batch.shape[0]
     with torch.no_grad():
         if use_tta:
-            h, w = imgs_batch.shape[2:]
+            # 仅保留翻转，去掉缩放，与 train.py 保持逻辑更接近
             outs = [model(imgs_batch)]
-            # 批量翻转（保持batch维度不变）
-            outs.append(model(torch.flip(imgs_batch, [3])))
-            outs.append(model(torch.flip(imgs_batch, [2])))
-            outs.append(model(torch.flip(imgs_batch, [2, 3])))
-            # 批量缩放
-            s = F.interpolate(imgs_batch, size=(int(h*0.9), int(w*0.9)), mode='bilinear', align_corners=False)
-            s = F.interpolate(s, size=(h, w), mode='bilinear', align_corners=False)
-            outs.append(model(s))
-            # 对batch中每个样本取平均（dim=0是TTA轮次维度）
+            outs.append(model(torch.flip(imgs_batch, [3]))) # 水平
+            outs.append(model(torch.flip(imgs_batch, [2]))) # 垂直
+            # outs.append(model(torch.flip(imgs_batch, [2, 3]))) # 双翻转 (可选，train.py里没用这个)
+            
+            # 去掉这个缩放，因为它可能导致细节丢失
+            # s = F.interpolate(...) 
+            # outs.append(model(s))
+            
             out = torch.mean(torch.stack(outs), dim=0)
         else:
             out = model(imgs_batch)
@@ -100,15 +99,16 @@ def predict(model, img, device, use_tta=True):
     img = img.to(device)
     with torch.no_grad():
         if use_tta:
-            h, w = img.shape[2:]
+            # 修改：与 predict_batch 保持完全一致 (原图 + 水平 + 垂直)
             outs = [model(img)]
-            outs.append(model(torch.flip(img, [3])))
-            outs.append(model(torch.flip(img, [2])))
-            outs.append(model(torch.flip(img, [2, 3])))
-            # 缩放
-            s = F.interpolate(img, size=(int(h*0.9), int(w*0.9)), mode='bilinear', align_corners=False)
-            s = F.interpolate(s, size=(h, w), mode='bilinear', align_corners=False)
-            outs.append(model(s))
+            outs.append(model(torch.flip(img, [3]))) # 水平
+            outs.append(model(torch.flip(img, [2]))) # 垂直
+            
+            # 删除双翻转和缩放，防止逻辑不一致
+            # outs.append(model(torch.flip(img, [2, 3])))
+            # s = F.interpolate(...)
+            # outs.append(model(s))
+            
             out = torch.mean(torch.stack(outs), dim=0)
         else:
             out = model(img)
@@ -121,12 +121,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("test_img_dir", type=str)
     parser.add_argument("output_path", type=str)
-    parser.add_argument("--batch_size", type=int, default=32, help="批量大小（根据GPU显存调整）")  # 新增批量参数
+    parser.add_argument("--batch_size", type=int, default=32, help="批量大小")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 【新增】半精度推理（GPU专属优化，速度提升2~3倍，精度损失极小）
     dtype = torch.float16 if device.type == "cuda" else torch.float32
     
     root = Path(__file__).resolve().parent.parent
@@ -137,14 +135,22 @@ def main():
         raise ValueError(f"num_classes mismatch: {config['num_classes']} vs {len(CATEGORY_IDS)}")
     
     model = load_model(root / "model" / "best_model.pth", config["num_classes"], device)
-    model = model.to(dtype=dtype)  # 模型转半精度
+    model = model.to(dtype=dtype)
     
     img_dir = Path(args.test_img_dir)
     imgs = sorted([p for p in img_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
     
-    size = tuple(config["input_size"])
+    # 核心修复：优先使用 Phase 3 的高分辨率尺寸
+    if config.get("final_finetune", False) and "final_finetune_size" in config:
+        size = tuple(config["final_finetune_size"])
+        # print(f"检测到 Phase 3 微调，使用高分辨率进行预测: {size}")
+    else:
+        size = tuple(config["input_size"])
+        # print(f"ℹ使用标准分辨率进行预测: {size}")
+    
     mean, std = config["mean"], config["std"]
-    use_tta = config.get("use_tta", False)  # 默认关闭TTA，如需启用再改回True
+    # 建议开启 TTA 以获得这最后的 0.5% 提升
+    use_tta = config.get("use_tta", True) 
     batch_size = args.batch_size
     
     results = []
@@ -187,11 +193,13 @@ def main():
             for path in valid_paths:
                 try:
                     # 使用原始的单张图片处理逻辑
-                    # from your_original_predict import preprocess, predict  # 需要导入原函数
                     img_tensor = preprocess(path, size, mean, std)
                     if device.type == "cuda":
                         img_tensor = img_tensor.half()
-                    idx, conf = predict(model, img_tensor, device, use_tta=False)  # 回退时禁用TTA
+                    
+                    # 修改：回退时也要使用 TTA，保持一致性！
+                    idx, conf = predict(model, img_tensor, device, use_tta=use_tta) 
+                    
                     results.append({
                         "filename": path.name,
                         "category_id": CATEGORY_IDS[idx],
